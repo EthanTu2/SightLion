@@ -10,16 +10,6 @@ import numpy as np
 
 from signals import mp_drawing, mp_drawing_styles, mp_face_mesh, mp_pose
 
-SHORT_SIGNAL_LABELS = {
-    "slumped_posture": "Posture",
-    "body_sway": "Sway",
-    "tripod_position": "Tripod",
-    "arm_drift": "Arm drift",
-    "hands_near_throat": "Hands throat",
-    "facial_asymmetry": "Face asym.",
-    "low_alertness": "Alertness",
-}
-
 
 def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
     normalized = hex_color.lstrip("#")
@@ -36,18 +26,6 @@ def _hex_to_bgr(hex_color: str) -> tuple[int, int, int]:
 def format_signal_name(signal_name: str) -> str:
     """Convert a snake_case signal name into a UI label."""
     return signal_name.replace("_", " ").title()
-
-
-def get_signal_bgr(value: float) -> tuple[int, int, int]:
-    if value > 0.6:
-        return (74, 75, 226)
-    if value >= 0.3:
-        return (39, 159, 239)
-    return (80, 175, 76)
-
-
-def get_signal_label(signal_name: str) -> str:
-    return SHORT_SIGNAL_LABELS.get(signal_name, format_signal_name(signal_name))
 
 
 def create_placeholder_thumbnail(label: str, hex_color: str):
@@ -100,6 +78,25 @@ def draw_landmark_overlay(frame_bgr, pose_results, face_results) -> None:
         )
 
 
+_LEVEL_BGR = {
+    "HIGH": (38, 38, 220),
+    "MODERATE": (6, 119, 217),
+    "YES": (38, 38, 220),
+    "NO": (74, 163, 22),
+    "Unresponsive": (38, 38, 220),
+    "Drowsy": (6, 119, 217),
+    "Alert": (74, 163, 22),
+    "LOW": (74, 163, 22),
+}
+
+_HUD_ASSESS_ORDER = [
+    ("stroke_risk", "STROKE RISK"),
+    ("fall_risk", "FALL RISK"),
+    ("respiratory", "RESPIRATORY"),
+    ("mental_status", "MENTAL STATUS"),
+]
+
+
 def _score_bgr(score: int) -> tuple[int, int, int]:
     if score >= 65:
         return (38, 38, 220)
@@ -108,64 +105,83 @@ def _score_bgr(score: int) -> tuple[int, int, int]:
     return (74, 163, 22)
 
 
-def draw_signal_hud(frame_bgr, signals: dict, score: int, countdown_text: str | None = None) -> None:
-    """Draw a semi-transparent live HUD panel with signal values."""
+def draw_clinical_hud(
+    frame_bgr,
+    assessments: dict,
+    score: int,
+    countdown_text: str | None = None,
+) -> None:
+    """Draw a clinical-assessment HUD panel on the video frame."""
     overlay = frame_bgr.copy()
-    panel_width = 370
-    line_height = 32
-    header_h = 52
-    footer_h = 70
-    panel_height = header_h + (len(signals) * line_height) + footer_h
+    panel_width = 340
+    line_height = 28
+    findings_lh = 18
+    header_h = 48
+    footer_h = 60
     x0, y0 = 14, 14
+
+    total_findings = sum(len(a.get("findings", [])) for a in assessments.values())
+    panel_height = header_h + (len(_HUD_ASSESS_ORDER) * line_height) + (total_findings * findings_lh) + footer_h
     x1, y1 = x0 + panel_width, y0 + panel_height
 
     cv2.rectangle(overlay, (x0, y0), (x1, y1), (10, 15, 25), -1)
-    cv2.addWeighted(overlay, 0.80, frame_bgr, 0.20, 0, frame_bgr)
+    cv2.addWeighted(overlay, 0.82, frame_bgr, 0.18, 0, frame_bgr)
     cv2.rectangle(frame_bgr, (x0, y0), (x1, y1), (60, 70, 90), 1)
 
-    cv2.putText(frame_bgr, "LIVE TRIAGE SIGNALS", (30, 42),
+    cv2.putText(frame_bgr, "TRIAGE ASSESSMENT", (30, 40),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (148, 163, 184), 1, cv2.LINE_AA)
-    cv2.line(frame_bgr, (30, 50), (x1 - 16, 50), (40, 50, 70), 1)
+    cv2.line(frame_bgr, (30, 48), (x1 - 16, 48), (40, 50, 70), 1)
 
-    y_pos = 74
-    for signal_name, value in signals.items():
-        v = float(value)
-        color = get_signal_bgr(v)
-        cv2.circle(frame_bgr, (34, y_pos - 4), 6, color, -1)
-        label_text = f"{get_signal_label(signal_name)}"
-        cv2.putText(frame_bgr, label_text, (50, y_pos),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (180, 190, 210), 1, cv2.LINE_AA)
-        val_text = f"{v:.2f}"
-        val_size, _ = cv2.getTextSize(val_text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
-        cv2.putText(frame_bgr, val_text, (x1 - 22 - val_size[0], y_pos),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2, cv2.LINE_AA)
+    y_pos = 72
+    for key, label in _HUD_ASSESS_ORDER:
+        a = assessments.get(key, {"level": "—", "findings": []})
+        level = a["level"]
+        color = _LEVEL_BGR.get(level, (148, 163, 184))
 
-        bar_x0, bar_y0 = 50, y_pos + 6
-        bar_w = panel_width - 72
-        cv2.rectangle(frame_bgr, (bar_x0, bar_y0), (bar_x0 + bar_w, bar_y0 + 3), (40, 50, 70), -1)
-        fill_w = max(1, int(bar_w * v))
-        cv2.rectangle(frame_bgr, (bar_x0, bar_y0), (bar_x0 + fill_w, bar_y0 + 3), color, -1)
-
+        cv2.circle(frame_bgr, (34, y_pos - 4), 5, color, -1)
+        cv2.putText(frame_bgr, label, (48, y_pos),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 190, 210), 1, cv2.LINE_AA)
+        lvl_size, _ = cv2.getTextSize(level, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 2)
+        cv2.putText(frame_bgr, level, (x1 - 20 - lvl_size[0], y_pos),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2, cv2.LINE_AA)
         y_pos += line_height
+
+        for finding in a.get("findings", []):
+            cv2.putText(frame_bgr, finding, (56, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.34, (130, 140, 160), 1, cv2.LINE_AA)
+            y_pos += findings_lh
 
     cv2.line(frame_bgr, (30, y_pos + 2), (x1 - 16, y_pos + 2), (40, 50, 70), 1)
 
     score_color = _score_bgr(score)
-    cv2.putText(frame_bgr, "SCORE", (30, y_pos + 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (148, 163, 184), 1, cv2.LINE_AA)
-    cv2.putText(frame_bgr, str(score), (100, y_pos + 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.95, score_color, 3, cv2.LINE_AA)
+    cv2.putText(frame_bgr, "SEVERITY", (30, y_pos + 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (148, 163, 184), 1, cv2.LINE_AA)
+    cv2.putText(frame_bgr, str(score), (110, y_pos + 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.90, score_color, 3, cv2.LINE_AA)
+    score_w, _ = cv2.getTextSize(str(score), cv2.FONT_HERSHEY_SIMPLEX, 0.90, 3)
+    cv2.putText(frame_bgr, "/ 100", (112 + score_w[0] + 4, y_pos + 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 130, 150), 1, cv2.LINE_AA)
 
     if countdown_text:
-        cv2.putText(frame_bgr, countdown_text, (30, y_pos + 52),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (253, 224, 71), 1, cv2.LINE_AA)
+        cv2.putText(frame_bgr, countdown_text, (30, y_pos + 46),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (253, 224, 71), 1, cv2.LINE_AA)
 
 
-def annotate_frame(frame_bgr, pose_results, face_results, signals: dict, score: int, countdown_text: str | None = None):
-    """Return a BGR frame with landmarks and HUD annotations."""
+def annotate_frame(
+    frame_bgr,
+    pose_results,
+    face_results,
+    signals: dict,
+    score: int,
+    countdown_text: str | None = None,
+):
+    """Return a BGR frame with landmarks and clinical HUD annotations."""
+    from scorer import derive_clinical_assessments
+
     annotated = frame_bgr.copy()
     draw_landmark_overlay(annotated, pose_results, face_results)
-    draw_signal_hud(annotated, signals, score, countdown_text=countdown_text)
+    assessments = derive_clinical_assessments(signals)
+    draw_clinical_hud(annotated, assessments, score, countdown_text=countdown_text)
     return annotated
 
 

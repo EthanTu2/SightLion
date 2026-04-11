@@ -12,7 +12,12 @@ import cv2
 import streamlit as st
 
 from processor import build_demo_patients, build_patient_record, get_demo_profiles
-from scorer import compute_score
+from scorer import (
+    ASSESSMENT_LABELS,
+    compute_score,
+    derive_clinical_assessments,
+    get_priority,
+)
 from signals import (
     FRAME_SAMPLE_RATE,
     SIGNAL_KEYS,
@@ -25,7 +30,6 @@ from signals import (
 from utils import (
     annotate_frame,
     create_demo_frame,
-    format_signal_name,
     image_to_base64,
     resize_thumbnail,
 )
@@ -36,21 +40,25 @@ PLAYBACK_SPEEDS = {"0.5x": 0.5, "1x": 1.0, "2x": 2.0}
 CRITICAL_SCORE_THRESHOLD = 65
 CRITICAL_ALERT_SECONDS = 5.0
 
-_SIGNAL_SHORT = {
-    "slumped_posture": "Posture",
-    "body_sway": "Sway",
-    "tripod_position": "Tripod",
-    "arm_drift": "Arm Drift",
-    "hands_near_throat": "Throat",
-    "facial_asymmetry": "Asymmetry",
-    "low_alertness": "Alertness",
+_ASSESS_ICONS = {
+    "stroke_risk": "\U0001f9e0",
+    "fall_risk": "\U0001f6b6",
+    "respiratory": "\U0001fab7",
+    "mental_status": "\U0001f441",
+}
+
+_ASSESS_TIPS = {
+    "stroke_risk": "FAST screen: facial droop and arm weakness indicate stroke risk.",
+    "fall_risk": "Balance instability and postural collapse indicate fall risk.",
+    "respiratory": "Tripod posture and airway distress gestures suggest respiratory concern.",
+    "mental_status": "Eye-opening and alertness indicate mental status level.",
 }
 
 
-def _bar_color(v: float) -> str:
-    if v > 0.6:
+def _level_css_color(level: str) -> str:
+    if level in ("HIGH", "YES", "Unresponsive"):
         return "#DC2626"
-    if v >= 0.3:
+    if level in ("MODERATE", "Drowsy"):
         return "#D97706"
     return "#16A34A"
 
@@ -120,53 +128,75 @@ def _inject_styles() -> None:
                 border-radius: 7px; display: block; width: 100%;
             }
 
-            /* ── Signal tiles ───────────────────────────── */
-            .tv-signal-row {
-                display: flex; gap: 6px;
+            /* ── Clinical assessment tiles ────────────────── */
+            .tv-assess-row {
+                display: flex; gap: 8px;
                 margin-bottom: 14px;
             }
-            .tv-signal-cell {
+            .tv-assess-cell {
                 flex: 1; text-align: center;
                 background: #fff;
                 border: 1px solid var(--slate-200);
-                border-radius: 8px;
-                padding: 10px 2px 12px;
+                border-radius: 10px;
+                padding: 14px 6px 12px;
                 transition: box-shadow 0.15s;
                 position: relative;
             }
-            .tv-signal-cell:hover { box-shadow: 0 1px 4px rgba(0,0,0,0.06); z-index: 10; }
-            .tv-signal-tip {
+            .tv-assess-cell:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.08); z-index: 10; }
+            .tv-assess-tip {
                 visibility: hidden; opacity: 0;
                 position: absolute; bottom: calc(100% + 8px); left: 50%;
                 transform: translateX(-50%);
                 background: var(--slate-900); color: #fff;
                 padding: 8px 12px; border-radius: 6px;
                 font-size: 11px; font-weight: 400; line-height: 1.45;
-                width: 185px; text-align: left;
+                width: 195px; text-align: left;
                 text-transform: none; letter-spacing: normal;
                 pointer-events: none;
                 transition: opacity 0.15s, visibility 0.15s;
                 box-shadow: 0 4px 12px rgba(0,0,0,0.18);
             }
-            .tv-signal-tip::after {
+            .tv-assess-tip::after {
                 content: ""; position: absolute; top: 100%; left: 50%;
                 transform: translateX(-50%);
                 border: 6px solid transparent; border-top-color: var(--slate-900);
             }
-            .tv-signal-cell:hover .tv-signal-tip { visibility: visible; opacity: 1; }
-            .tv-signal-lbl {
-                font-size: 9.5px; font-weight: 700; color: var(--slate-500);
-                text-transform: uppercase; letter-spacing: 0.4px;
-                margin-bottom: 8px;
+            .tv-assess-cell:hover .tv-assess-tip { visibility: visible; opacity: 1; }
+            .tv-assess-icon { font-size: 20px; margin-bottom: 4px; }
+            .tv-assess-title {
+                font-size: 9px; font-weight: 700; color: var(--slate-500);
+                text-transform: uppercase; letter-spacing: 0.5px;
+                margin-bottom: 6px;
             }
-            .tv-signal-track {
-                height: 6px; border-radius: 999px;
-                background: var(--slate-200);
-                overflow: hidden; margin: 0 6px;
+            .tv-assess-level {
+                font-size: 16px; font-weight: 800;
+                margin-bottom: 4px;
             }
-            .tv-signal-fill { height: 100%; border-radius: 999px; transition: width 0.2s; }
-            .tv-signal-val {
-                font-size: 12px; font-weight: 800; margin-top: 6px;
+            .tv-assess-findings {
+                font-size: 10px; color: var(--slate-400);
+                line-height: 1.4;
+                min-height: 14px;
+            }
+            /* ── Score tile (wider) ──────────────────────── */
+            .tv-score-tile {
+                flex: 0.8; text-align: center;
+                background: #fff;
+                border: 1px solid var(--slate-200);
+                border-radius: 10px;
+                padding: 14px 10px 12px;
+                display: flex; flex-direction: column;
+                align-items: center; justify-content: center;
+            }
+            .tv-score-tile-label {
+                font-size: 9px; font-weight: 700; color: var(--slate-500);
+                text-transform: uppercase; letter-spacing: 0.5px;
+                margin-bottom: 4px;
+            }
+            .tv-score-tile-value {
+                font-size: 28px; font-weight: 900; line-height: 1;
+            }
+            .tv-score-tile-sub {
+                font-size: 11px; font-weight: 600; margin-top: 2px;
             }
 
             /* ── Queue header ───────────────────────────── */
@@ -213,11 +243,26 @@ def _inject_styles() -> None:
                 background: var(--slate-200); border-radius: 999px; overflow: hidden;
             }
             .tv-card-fill { height: 100%; border-radius: 999px; }
-            .tv-card-explanation {
-                margin-top: 10px; font-size: 12.5px; color: var(--slate-500);
-                line-height: 1.5;
+
+            /* ── Card clinical assessments ────────────────── */
+            .tv-card-assess {
+                margin-top: 12px;
+                display: flex; flex-direction: column; gap: 4px;
             }
-            .tv-card-ts { margin-top: 4px; font-size: 11px; color: var(--slate-400); }
+            .tv-card-assess-row {
+                display: flex; align-items: baseline; gap: 6px;
+                font-size: 12.5px; line-height: 1.5;
+            }
+            .tv-card-assess-label {
+                font-weight: 600; color: var(--slate-600);
+                min-width: 90px;
+            }
+            .tv-card-assess-level { font-weight: 800; }
+            .tv-card-assess-findings {
+                font-weight: 400; color: var(--slate-400);
+                font-size: 11.5px;
+            }
+            .tv-card-ts { margin-top: 8px; font-size: 11px; color: var(--slate-400); }
             .tv-card-warning {
                 margin-top: 8px; padding: 6px 10px; border-radius: 6px;
                 background: #FFFBEB; border: 1px solid #FDE68A;
@@ -310,19 +355,93 @@ def _consume_patient_id(override_value: str) -> str:
     return f"Patient {patient_number:03d}"
 
 
+# ---------------------------------------------------------------------------
+# Clinical assessment tiles (below the video)
+# ---------------------------------------------------------------------------
+
+def _update_assess_tiles(slot, signals: dict) -> None:
+    """Render clinical assessment tiles + severity score below the live feed."""
+    assessments = derive_clinical_assessments(signals)
+    score = compute_score(signals)
+    priority = get_priority(score)
+
+    cells = ""
+    for key in ("stroke_risk", "fall_risk", "respiratory", "mental_status"):
+        a = assessments[key]
+        level = a["level"]
+        color = _level_css_color(level)
+        icon = _ASSESS_ICONS.get(key, "")
+        title = ASSESSMENT_LABELS[key].upper()
+        tip = _ASSESS_TIPS.get(key, "")
+        findings = " &middot; ".join(html.escape(f) for f in a.get("findings", []))
+        if not findings:
+            findings = "&mdash;"
+        cells += (
+            f'<div class="tv-assess-cell">'
+            f'<div class="tv-assess-tip">{html.escape(tip)}</div>'
+            f'<div class="tv-assess-icon">{icon}</div>'
+            f'<div class="tv-assess-title">{title}</div>'
+            f'<div class="tv-assess-level" style="color:{color};">{html.escape(level)}</div>'
+            f'<div class="tv-assess-findings">{findings}</div>'
+            f'</div>'
+        )
+
+    score_color = priority["hex"]
+    score_label = priority["label"]
+    cells += (
+        f'<div class="tv-score-tile">'
+        f'<div class="tv-score-tile-label">SEVERITY</div>'
+        f'<div class="tv-score-tile-value" style="color:{score_color};">{score}</div>'
+        f'<div class="tv-score-tile-sub" style="color:{score_color};">{html.escape(score_label)}</div>'
+        f'</div>'
+    )
+
+    slot.markdown(
+        f'<div class="tv-assess-row">{cells}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Patient card (right column)
+# ---------------------------------------------------------------------------
+
 def _render_patient_card(patient: dict) -> None:
-    b64 = image_to_base64(patient.get("thumbnail"))
     pid = html.escape(str(patient.get("patient_id", "Unknown")))
     label = html.escape(str(patient.get("label", "Stable")))
-    explanation = html.escape(str(patient.get("explanation", "")))
     ts = html.escape(str(patient.get("timestamp", "")))
     hex_color = patient["hex"]
     score = patient["score"]
+
+    assessments = patient.get("assessments") or derive_clinical_assessments(
+        patient.get("signals", {})
+    )
 
     warning = patient.get("warning")
     warn_block = ""
     if warning:
         warn_block = f'<div class="tv-card-warning">{html.escape(str(warning))}</div>'
+
+    assess_rows = ""
+    for key in ("stroke_risk", "fall_risk", "respiratory", "mental_status"):
+        a = assessments.get(key, {"level": "\u2014", "findings": [], "color": "#94A3B8"})
+        a_label = html.escape(ASSESSMENT_LABELS.get(key, key))
+        level = html.escape(a["level"])
+        color = _level_css_color(a["level"])
+        findings = ""
+        if a.get("findings"):
+            findings = (
+                f'<span class="tv-card-assess-findings">'
+                f' \u2014 {html.escape(", ".join(a["findings"]))}'
+                f'</span>'
+            )
+        assess_rows += (
+            f'<div class="tv-card-assess-row">'
+            f'<span class="tv-card-assess-label">{a_label}:</span>'
+            f'<span class="tv-card-assess-level" style="color:{color};">{level}</span>'
+            f'{findings}'
+            f'</div>'
+        )
 
     card_html = (
         f'<div class="tv-card">'
@@ -335,12 +454,12 @@ def _render_patient_card(patient: dict) -> None:
         f'</div>'
         f'<div class="tv-card-row2">'
         f'<div class="tv-card-score" style="color:{hex_color};">{score}</div>'
-        f'<div class="tv-card-score-sub">/ 100</div>'
+        f'<div class="tv-card-score-sub">/ 100 &nbsp; Triage Severity</div>'
         f'</div>'
         f'<div class="tv-card-track">'
         f'<div class="tv-card-fill" style="width:{score}%;background:{hex_color};"></div>'
         f'</div>'
-        f'<div class="tv-card-explanation">{explanation}</div>'
+        f'<div class="tv-card-assess">{assess_rows}</div>'
         f'<div class="tv-card-ts">{ts}</div>'
         f'{warn_block}'
         f'</div>'
@@ -349,48 +468,10 @@ def _render_patient_card(patient: dict) -> None:
     )
     st.markdown(card_html, unsafe_allow_html=True)
 
-    with st.expander("Signal breakdown"):
-        for signal_name in SIGNAL_KEYS:
-            value = float(patient.get("signals", {}).get(signal_name, 0.0))
-            st.progress(
-                int(value * 100),
-                text=f"{format_signal_name(signal_name)}  —  {value:.2f}",
-            )
 
-
-_SIGNAL_TIPS = {
-    "slumped_posture": "Measures head drop relative to torso length. Higher values indicate the patient is slumping forward.",
-    "body_sway": "Tracks lateral movement of the nose over time. Higher values indicate more postural instability.",
-    "tripod_position": "Detects forward lean combined with hands braced near the hips or knees \u2014 a sign of respiratory distress.",
-    "arm_drift": "Measures vertical asymmetry between left and right wrists. Higher values suggest one arm is drifting downward.",
-    "hands_near_throat": "Detects fingers or wrists in the throat/neck area across multiple frames.",
-    "facial_asymmetry": "Compares the symmetry of eye and mouth positions relative to the nose centerline.",
-    "low_alertness": "Monitors the Eye Aspect Ratio of both eyes. Higher values indicate the eyes are closing.",
-}
-
-
-def _update_signal_bars(signal_slot, signals: dict) -> None:
-    cells = ""
-    for key in SIGNAL_KEYS:
-        v = float(signals.get(key, 0.0))
-        color = _bar_color(v)
-        label = _SIGNAL_SHORT.get(key, key)
-        tip = _SIGNAL_TIPS.get(key, "")
-        cells += (
-            f'<div class="tv-signal-cell">'
-            f'<div class="tv-signal-tip">{tip}</div>'
-            f'<div class="tv-signal-lbl">{label}</div>'
-            f'<div class="tv-signal-track">'
-            f'<div class="tv-signal-fill" style="width:{int(v*100)}%;background:{color};"></div>'
-            f'</div>'
-            f'<div class="tv-signal-val" style="color:{color};">{v:.2f}</div>'
-            f'</div>'
-        )
-    signal_slot.markdown(
-        f'<div class="tv-signal-row">{cells}</div>',
-        unsafe_allow_html=True,
-    )
-
+# ---------------------------------------------------------------------------
+# Video processing helpers
+# ---------------------------------------------------------------------------
 
 def _frame_to_rgb(frame_bgr):
     return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -453,7 +534,7 @@ def _stream_capture_loop(
                 countdown_text=countdown_text,
             )
             frame_slot.image(_frame_to_rgb(annotated), width="stretch")
-            _update_signal_bars(signal_slot, latest_signals)
+            _update_assess_tiles(signal_slot, latest_signals)
 
             if sleep_seconds > 0:
                 time.sleep(sleep_seconds)
@@ -552,7 +633,7 @@ def _run_continuous_monitoring(frame_slot, signal_slot):
                         )
                         st.session_state["patients"].append(record)
                         _notify(
-                            f"\U0001f6a8 CRITICAL ALERT — {pid} auto-saved "
+                            f"\U0001f6a8 CRITICAL ALERT \u2014 {pid} auto-saved "
                             f"(score {score} for {CRITICAL_ALERT_SECONDS:.0f}s)"
                         )
                         accumulator = SignalAccumulator()
@@ -581,7 +662,7 @@ def _run_continuous_monitoring(frame_slot, signal_slot):
                     cv2.rectangle(annotated, (0, 0), (w - 1, h - 1), color, 6)
 
                 frame_slot.image(_frame_to_rgb(annotated), width="stretch")
-                _update_signal_bars(signal_slot, latest_signals)
+                _update_assess_tiles(signal_slot, latest_signals)
 
                 st.session_state["monitoring_data"] = {
                     "signals": accumulator.final_signals(),
@@ -630,9 +711,13 @@ def _animate_demo_feed(frame_slot, signal_slot, profile: dict) -> None:
             frame, None, None, animated_signals, profile["score"], countdown_text="Demo feed"
         )
         frame_slot.image(_frame_to_rgb(annotated), width="stretch")
-        _update_signal_bars(signal_slot, animated_signals)
+        _update_assess_tiles(signal_slot, animated_signals)
         time.sleep(0.04)
 
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
 
 def _sidebar_controls() -> tuple[str, int, str, list, float, bool, bool]:
     with st.sidebar:
@@ -684,8 +769,8 @@ def _sidebar_controls() -> tuple[str, int, str, list, float, bool, bool]:
 
         st.markdown(
             '<div class="tv-build-note">'
-            "SightLion MVP — rules-based signal extraction, weighted scoring, "
-            "priority queue, live webcam, video playback, and demo mode."
+            "SightLion \u2014 AI-assisted ER intake triage with clinical assessments, "
+            "severity scoring, and priority queue."
             "</div>",
             unsafe_allow_html=True,
         )
@@ -700,6 +785,10 @@ def _sidebar_controls() -> tuple[str, int, str, list, float, bool, bool]:
         clear_queue,
     )
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     """Render the SightLion dashboard."""
@@ -742,7 +831,7 @@ def main() -> None:
 
     with left_col:
         st.markdown(
-            '<div class="tv-disclaimer">⚠️ For staff review only. Not a diagnostic tool.</div>',
+            '<div class="tv-disclaimer">\u26a0\ufe0f For staff review only. Not a diagnostic tool.</div>',
             unsafe_allow_html=True,
         )
 
@@ -759,13 +848,13 @@ def main() -> None:
         if mode == "Live Webcam" and not has_webcam:
             st.markdown(
                 '<div class="tv-empty">'
-                '<div class="tv-empty-icon">📷</div>'
+                '<div class="tv-empty-icon">\U0001f4f7</div>'
                 "No webcam detected.<br>"
                 "Switch to <b>Video Upload</b> mode or press <b>Load Demo</b> to explore."
                 "</div>",
                 unsafe_allow_html=True,
             )
-            _update_signal_bars(signal_slot, zero_signals())
+            _update_assess_tiles(signal_slot, zero_signals())
 
         elif use_webcam:
             continuous = st.session_state.get("continuous_mode", False)
@@ -837,7 +926,7 @@ def main() -> None:
             _, btn_col, _ = st.columns([1, 2, 1])
             with btn_col:
                 analyze = st.button(
-                    "▶  Play & Analyze Uploads", type="primary"
+                    "\u25b6  Play & Analyze Uploads", type="primary"
                 )
 
             if analyze and uploaded_files:
@@ -863,12 +952,12 @@ def main() -> None:
             elif uploaded_files:
                 st.markdown(
                     '<div class="tv-empty">'
-                    '<div class="tv-empty-icon">🎬</div>'
+                    '<div class="tv-empty-icon">\U0001f3ac</div>'
                     "Videos ready. Press <b>Play &amp; Analyze Uploads</b> to begin."
                     "</div>",
                     unsafe_allow_html=True,
                 )
-                _update_signal_bars(signal_slot, zero_signals())
+                _update_assess_tiles(signal_slot, zero_signals())
 
             else:
                 selected_profile = next(
@@ -897,7 +986,7 @@ def main() -> None:
         if not patients:
             st.markdown(
                 '<div class="tv-empty">'
-                '<div class="tv-empty-icon">🏥</div>'
+                '<div class="tv-empty-icon">\U0001f3e5</div>'
                 "No patients in queue yet.<br>"
                 "Start a capture, upload videos, or press <b>Load Demo</b>."
                 "</div>",
@@ -909,9 +998,9 @@ def main() -> None:
 
         st.markdown(
             '<div class="tv-legend">'
-            '<span class="tv-legend-dot" style="color:#DC2626;">●</span> Critical ≥ 65 &nbsp;&nbsp;'
-            '<span class="tv-legend-dot" style="color:#D97706;">●</span> Urgent 35–64 &nbsp;&nbsp;'
-            '<span class="tv-legend-dot" style="color:#16A34A;">●</span> Stable &lt; 35'
+            '<span class="tv-legend-dot" style="color:#DC2626;">\u25cf</span> Critical \u2265 65 &nbsp;&nbsp;'
+            '<span class="tv-legend-dot" style="color:#D97706;">\u25cf</span> Urgent 35\u201364 &nbsp;&nbsp;'
+            '<span class="tv-legend-dot" style="color:#16A34A;">\u25cf</span> Stable &lt; 35'
             "</div>",
             unsafe_allow_html=True,
         )

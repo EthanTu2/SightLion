@@ -8,61 +8,67 @@ from typing import Dict, List
 
 import cv2
 
-from scorer import WEIGHTS, compute_score, generate_explanation, get_priority
+from scorer import (
+    WEIGHTS,
+    compute_score,
+    derive_clinical_assessments,
+    generate_explanation,
+    get_priority,
+)
 from signals import MIN_VALID_FRAMES, extract_signals
 from utils import create_placeholder_thumbnail, resize_thumbnail
 
 DEMO_PATIENT_PROFILES = [
     {
         "patient_id": "Patient A",
-        "score": 82,
+        "score": 78,
         "signals": {
-            "slumped_posture": 0.34,
-            "body_sway": 0.83,
-            "tripod_position": 0.12,
-            "arm_drift": 0.18,
-            "hands_near_throat": 0.91,
-            "facial_asymmetry": 0.12,
-            "low_alertness": 0.22,
+            "slumped_posture": 0.20,
+            "body_sway": 0.35,
+            "tripod_position": 0.08,
+            "arm_drift": 0.62,
+            "hands_near_throat": 0.10,
+            "facial_asymmetry": 0.70,
+            "low_alertness": 0.15,
         },
     },
     {
         "patient_id": "Patient B",
-        "score": 58,
+        "score": 52,
         "signals": {
-            "slumped_posture": 0.77,
-            "body_sway": 0.41,
-            "tripod_position": 0.18,
-            "arm_drift": 0.74,
-            "hands_near_throat": 0.08,
-            "facial_asymmetry": 0.14,
-            "low_alertness": 0.19,
+            "slumped_posture": 0.65,
+            "body_sway": 0.55,
+            "tripod_position": 0.10,
+            "arm_drift": 0.20,
+            "hands_near_throat": 0.05,
+            "facial_asymmetry": 0.10,
+            "low_alertness": 0.40,
         },
     },
     {
         "patient_id": "Patient C",
-        "score": 71,
+        "score": 61,
         "signals": {
-            "slumped_posture": 0.28,
-            "body_sway": 0.22,
-            "tripod_position": 0.09,
-            "arm_drift": 0.21,
-            "hands_near_throat": 0.05,
-            "facial_asymmetry": 0.78,
-            "low_alertness": 0.87,
+            "slumped_posture": 0.15,
+            "body_sway": 0.12,
+            "tripod_position": 0.45,
+            "arm_drift": 0.10,
+            "hands_near_throat": 0.72,
+            "facial_asymmetry": 0.08,
+            "low_alertness": 0.65,
         },
     },
     {
         "patient_id": "Patient D",
-        "score": 22,
+        "score": 18,
         "signals": {
-            "slumped_posture": 0.09,
-            "body_sway": 0.11,
+            "slumped_posture": 0.08,
+            "body_sway": 0.10,
             "tripod_position": 0.04,
-            "arm_drift": 0.07,
-            "hands_near_throat": 0.03,
-            "facial_asymmetry": 0.06,
-            "low_alertness": 0.08,
+            "arm_drift": 0.06,
+            "hands_near_throat": 0.02,
+            "facial_asymmetry": 0.05,
+            "low_alertness": 0.07,
         },
     },
 ]
@@ -87,7 +93,7 @@ def build_patient_record(
     valid_frames = int(signals.get("_valid_frames", MIN_VALID_FRAMES))
     final_warning = warning
     if valid_frames < MIN_VALID_FRAMES and final_warning is None:
-        final_warning = "Insufficient data — manual review recommended"
+        final_warning = "Insufficient data \u2014 manual review recommended"
 
     if thumbnail is None:
         thumbnail = create_placeholder_thumbnail(patient_id, priority["hex"])
@@ -99,6 +105,7 @@ def build_patient_record(
         "label": priority["label"],
         "hex": priority["hex"],
         "explanation": generate_explanation(visible_signals, WEIGHTS),
+        "assessments": derive_clinical_assessments(visible_signals),
         "signals": visible_signals,
         "thumbnail": thumbnail,
         "timestamp": datetime.now().strftime("%H:%M:%S"),
