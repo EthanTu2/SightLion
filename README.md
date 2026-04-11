@@ -1,10 +1,10 @@
-# TriageVision
+# SightLion
 
-TriageVision is an AI-assisted ER intake monitoring MVP that reviews short patient videos, extracts visible distress signals with rules-based computer vision, and surfaces a color-coded priority queue for staff review.
+SightLion is an AI-assisted ER intake monitoring MVP that reviews short patient videos, extracts visible distress signals with rules-based computer vision, and surfaces a color-coded priority queue for staff review.
 
 ## Important disclaimer
 
-TriageVision is **not** a diagnostic tool. It only flags visible distress signals from video to help nurses and doctors triage patients faster.
+SightLion is **not** a diagnostic tool. It only flags visible distress signals from video to help nurses and doctors triage patients faster.
 
 ## Tech stack
 

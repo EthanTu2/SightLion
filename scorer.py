@@ -1,4 +1,4 @@
-"""Scoring helpers for TriageVision."""
+"""Scoring helpers for SightLion."""
 
 from __future__ import annotations
 

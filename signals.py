@@ -1,4 +1,4 @@
-"""Signal extraction for TriageVision."""
+"""Signal extraction for SightLion."""
 
 from __future__ import annotations
 

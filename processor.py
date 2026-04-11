@@ -1,4 +1,4 @@
-"""Video processing pipeline for TriageVision."""
+"""Video processing pipeline for SightLion."""
 
 from __future__ import annotations
 

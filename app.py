@@ -1,4 +1,4 @@
-"""Streamlit dashboard for TriageVision."""
+"""Streamlit dashboard for SightLion."""
 
 from __future__ import annotations
 
@@ -34,202 +34,208 @@ PREVIEW_SECONDS = 3.0
 DEFAULT_CAPTURE_SECONDS = 10
 PLAYBACK_SPEEDS = {"0.5x": 0.5, "1x": 1.0, "2x": 2.0}
 
+_SIGNAL_SHORT = {
+    "slumped_posture": "Posture",
+    "body_sway": "Sway",
+    "tripod_position": "Tripod",
+    "arm_drift": "Arm Drift",
+    "hands_near_throat": "Throat",
+    "facial_asymmetry": "Asymmetry",
+    "low_alertness": "Alertness",
+}
+
+
+def _bar_color(v: float) -> str:
+    if v > 0.6:
+        return "#DC2626"
+    if v >= 0.3:
+        return "#D97706"
+    return "#16A34A"
+
 
 def _inject_styles() -> None:
     st.markdown(
         """
         <style>
-            .stApp { background: #F4F6F9; }
+            :root {
+                --slate-50: #F8FAFC; --slate-100: #F1F5F9;
+                --slate-200: #E2E8F0; --slate-300: #CBD5E1;
+                --slate-400: #94A3B8; --slate-500: #64748B;
+                --slate-600: #475569; --slate-700: #334155;
+                --slate-800: #1E293B; --slate-900: #0F172A;
+                --red: #DC2626; --amber: #D97706; --green: #16A34A;
+            }
+            .stApp { background: var(--slate-100); }
 
             section[data-testid="stSidebar"] > div:first-child {
                 padding-top: 1rem;
             }
-            section[data-testid="stSidebar"] .stRadio > div { gap: 0.35rem; }
-            section[data-testid="stSidebar"] .stSlider { margin-bottom: -0.4rem; }
+            section[data-testid="stSidebar"] .stRadio > div { gap: 0.3rem; }
+            section[data-testid="stSidebar"] .stSlider { margin-bottom: -0.3rem; }
 
+            /* ── Header ─────────────────────────────────── */
             .tv-header {
-                background: linear-gradient(135deg, #0F172A 0%, #1E293B 100%);
-                color: #FFFFFF;
-                padding: 16px 24px;
-                border-radius: 10px;
-                margin-bottom: 16px;
-                display: flex;
-                align-items: center;
-                gap: 14px;
+                background: linear-gradient(135deg, var(--slate-900) 0%, var(--slate-800) 100%);
+                color: #fff;
+                padding: 18px 26px;
+                border-radius: 12px;
+                margin-bottom: 18px;
+                display: flex; align-items: center; gap: 16px;
+                box-shadow: 0 2px 8px rgba(15,23,42,0.12);
             }
             .tv-cross {
-                width: 32px; height: 32px;
-                border-radius: 7px;
-                background: #DC2626;
-                display: inline-flex;
-                align-items: center; justify-content: center;
-                font-size: 20px; font-weight: 700; color: #fff;
-                line-height: 1;
+                width: 34px; height: 34px; border-radius: 8px;
+                background: var(--red);
+                display: inline-flex; align-items: center; justify-content: center;
+                font-size: 20px; font-weight: 700; color: #fff; line-height: 1;
             }
-            .tv-header-title {
-                font-size: 22px; font-weight: 800;
-                letter-spacing: -0.4px;
-            }
-            .tv-header-sub {
-                font-size: 12.5px; color: #94A3B8;
-                margin-top: 3px;
-            }
+            .tv-header-title { font-size: 23px; font-weight: 800; letter-spacing: -0.5px; }
+            .tv-header-sub   { font-size: 12.5px; color: var(--slate-400); margin-top: 4px; }
 
+            /* ── Disclaimer ─────────────────────────────── */
             .tv-disclaimer {
-                background: #FFFBEB;
-                border: 1px solid #FDE68A;
-                color: #92400E;
-                border-radius: 8px;
-                padding: 7px 12px;
-                font-size: 12px;
-                font-weight: 600;
-                margin-bottom: 10px;
+                background: #FFFBEB; border: 1px solid #FDE68A; color: #92400E;
+                border-radius: 8px; padding: 7px 14px;
+                font-size: 12px; font-weight: 600; margin-bottom: 12px;
             }
 
+            /* ── Section labels ─────────────────────────── */
             .tv-section-label {
-                font-size: 14px;
-                font-weight: 800;
-                color: #1E293B;
-                text-transform: uppercase;
-                letter-spacing: 0.8px;
+                font-size: 11px; font-weight: 700; color: var(--slate-500);
+                text-transform: uppercase; letter-spacing: 1px;
                 margin-bottom: 8px;
             }
 
-            .tv-queue-header {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
+            /* ── Video frame wrapper ────────────────────── */
+            .tv-frame-wrap {
+                background: var(--slate-900);
+                border-radius: 10px;
+                padding: 4px;
+                box-shadow: 0 2px 12px rgba(15,23,42,0.15);
                 margin-bottom: 12px;
-                padding-bottom: 10px;
-                border-bottom: 1px solid #E2E8F0;
             }
-            .tv-queue-title {
-                font-size: 16px; font-weight: 800; color: #0F172A;
-                letter-spacing: -0.2px;
+            .tv-frame-wrap img {
+                border-radius: 7px; display: block; width: 100%;
             }
+
+            /* ── Signal tiles ───────────────────────────── */
+            .tv-signal-row {
+                display: flex; gap: 6px;
+                margin-bottom: 14px;
+            }
+            .tv-signal-cell {
+                flex: 1; text-align: center;
+                background: #fff;
+                border: 1px solid var(--slate-200);
+                border-radius: 8px;
+                padding: 10px 2px 12px;
+                transition: box-shadow 0.15s;
+            }
+            .tv-signal-cell:hover { box-shadow: 0 1px 4px rgba(0,0,0,0.06); }
+            .tv-signal-lbl {
+                font-size: 9.5px; font-weight: 700; color: var(--slate-500);
+                text-transform: uppercase; letter-spacing: 0.4px;
+                margin-bottom: 8px;
+            }
+            .tv-signal-track {
+                height: 6px; border-radius: 999px;
+                background: var(--slate-200);
+                overflow: hidden; margin: 0 6px;
+            }
+            .tv-signal-fill { height: 100%; border-radius: 999px; transition: width 0.2s; }
+            .tv-signal-val {
+                font-size: 12px; font-weight: 800; margin-top: 6px;
+            }
+
+            /* ── Queue header ───────────────────────────── */
+            .tv-queue-header {
+                display: flex; justify-content: space-between; align-items: center;
+                margin-bottom: 14px; padding-bottom: 12px;
+                border-bottom: 2px solid var(--slate-200);
+            }
+            .tv-queue-title { font-size: 17px; font-weight: 800; color: var(--slate-900); }
             .tv-count-badge {
-                background: #0F172A; color: #FFFFFF;
-                padding: 3px 10px; border-radius: 999px;
+                background: var(--slate-900); color: #fff;
+                padding: 4px 12px; border-radius: 999px;
                 font-size: 11px; font-weight: 700;
             }
 
+            /* ── Patient card ───────────────────────────── */
             .tv-card {
-                background: #FFFFFF;
-                border: 1px solid #E2E8F0;
-                border-radius: 10px;
-                overflow: hidden;
+                background: #fff;
+                border: 1px solid var(--slate-200);
+                border-radius: 10px; overflow: hidden;
                 margin-bottom: 12px;
                 box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+                transition: box-shadow 0.15s;
             }
+            .tv-card:hover { box-shadow: 0 3px 10px rgba(0,0,0,0.08); }
             .tv-card-inner { display: flex; align-items: stretch; }
-            .tv-card-bar { width: 5px; flex-shrink: 0; }
-            .tv-card-body {
-                padding: 16px; display: flex; gap: 14px; width: 100%;
+            .tv-card-bar { width: 5px; flex-shrink: 0; border-radius: 10px 0 0 10px; }
+            .tv-card-body { padding: 16px 18px; width: 100%; }
+            .tv-card-row1 {
+                display: flex; justify-content: space-between; align-items: center;
             }
-            .tv-card-thumb {
-                width: 64px; height: 64px;
-                object-fit: cover; border-radius: 8px;
-                border: 1px solid #E2E8F0;
-                flex-shrink: 0;
-            }
-            .tv-card-content { flex: 1; min-width: 0; }
-            .tv-card-top {
-                display: flex; justify-content: space-between;
-                align-items: center; gap: 8px;
-            }
-            .tv-card-pid {
-                font-size: 14px; font-weight: 700; color: #0F172A;
-                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-            }
+            .tv-card-pid { font-size: 14px; font-weight: 700; color: var(--slate-900); }
             .tv-card-pill {
                 padding: 3px 10px; border-radius: 999px;
-                font-size: 11px; font-weight: 700;
-                white-space: nowrap;
+                font-size: 11px; font-weight: 700; white-space: nowrap;
             }
-            .tv-card-score {
-                font-size: 24px; font-weight: 800; color: #0F172A;
-                margin-top: 6px;
+            .tv-card-row2 {
+                display: flex; align-items: baseline; gap: 8px; margin-top: 8px;
             }
-            .tv-card-score span { font-size: 13px; font-weight: 500; color: #94A3B8; }
-            .tv-card-bar-track {
-                margin-top: 6px; height: 5px;
-                background: #E2E8F0; border-radius: 999px; overflow: hidden;
+            .tv-card-score { font-size: 28px; font-weight: 800; line-height: 1; }
+            .tv-card-score-sub { font-size: 13px; font-weight: 500; color: var(--slate-400); }
+            .tv-card-track {
+                margin-top: 10px; height: 6px;
+                background: var(--slate-200); border-radius: 999px; overflow: hidden;
             }
-            .tv-card-bar-fill { height: 100%; border-radius: 999px; }
+            .tv-card-fill { height: 100%; border-radius: 999px; }
             .tv-card-explanation {
-                margin-top: 8px; font-size: 12px; color: #64748B;
-                line-height: 1.45;
+                margin-top: 10px; font-size: 12.5px; color: var(--slate-500);
+                line-height: 1.5;
             }
-            .tv-card-ts { margin-top: 4px; font-size: 11px; color: #94A3B8; }
+            .tv-card-ts { margin-top: 4px; font-size: 11px; color: var(--slate-400); }
             .tv-card-warning {
                 margin-top: 8px; padding: 6px 10px; border-radius: 6px;
                 background: #FFFBEB; border: 1px solid #FDE68A;
                 color: #92400E; font-size: 11px; font-weight: 600;
             }
 
+            /* ── Empty state ────────────────────────────── */
             .tv-empty {
-                text-align: center;
-                padding: 44px 20px;
-                color: #94A3B8; font-size: 13.5px;
-                background: #FFFFFF;
-                border: 1.5px dashed #CBD5E1;
-                border-radius: 12px;
-                line-height: 1.6;
+                text-align: center; padding: 48px 24px;
+                color: var(--slate-400); font-size: 13.5px;
+                background: #fff;
+                border: 1.5px dashed var(--slate-300);
+                border-radius: 12px; line-height: 1.7;
             }
-            .tv-empty-icon { font-size: 36px; margin-bottom: 10px; }
+            .tv-empty-icon { font-size: 40px; margin-bottom: 12px; }
+            .tv-empty b { color: var(--slate-600); }
 
+            /* ── Legend ──────────────────────────────────── */
             .tv-legend {
-                margin-top: 14px;
-                background: #FFFFFF;
-                border: 1px solid #E2E8F0;
-                border-radius: 8px;
-                padding: 12px 16px;
-                color: #475569;
-                font-size: 13px;
-                line-height: 1.7;
-                text-align: center;
+                margin-top: 16px;
+                background: #fff; border: 1px solid var(--slate-200);
+                border-radius: 8px; padding: 12px 18px;
+                color: var(--slate-600); font-size: 13px;
+                line-height: 1.8; text-align: center;
             }
+            .tv-legend-dot { font-weight: 800; font-size: 14px; }
 
+            /* ── Sidebar build note ─────────────────────── */
             .tv-build-note {
-                font-size: 10.5px; color: #94A3B8;
-                line-height: 1.45; margin-top: 6px;
-                border-top: 1px solid #E2E8F0;
-                padding-top: 8px;
+                font-size: 10.5px; color: var(--slate-400);
+                line-height: 1.45; margin-top: 8px;
+                border-top: 1px solid var(--slate-200);
+                padding-top: 10px;
             }
 
-            .tv-signal-row {
-                display: flex; gap: 8px;
-                margin-top: 8px;
-            }
-            .tv-signal-cell {
-                flex: 1; text-align: center;
-                background: #FFFFFF;
-                border: 1px solid #E2E8F0;
-                border-radius: 8px;
-                padding: 8px 4px 10px;
-            }
-            .tv-signal-cell-label {
-                font-size: 10px; font-weight: 600;
-                color: #64748B;
-                text-transform: uppercase;
-                letter-spacing: 0.3px;
-                margin-bottom: 6px;
-            }
-            .tv-signal-cell-bar {
-                height: 6px;
-                border-radius: 999px;
-                background: #E2E8F0;
-                overflow: hidden;
-                margin: 0 4px;
-            }
-            .tv-signal-cell-fill {
-                height: 100%;
-                border-radius: 999px;
-            }
-            .tv-signal-cell-val {
-                font-size: 11px; font-weight: 700;
-                color: #0F172A;
-                margin-top: 4px;
+            /* ── Primary button overrides ───────────────── */
+            .stButton > button[kind="primary"] {
+                border-radius: 8px; font-weight: 700;
+                padding: 0.55rem 1.2rem;
+                font-size: 14px;
             }
         </style>
         """,
@@ -298,20 +304,20 @@ def _render_patient_card(patient: dict) -> None:
         f'<div class="tv-card-inner">'
         f'<div class="tv-card-bar" style="background:{hex_color};"></div>'
         f'<div class="tv-card-body">'
-        f'<img class="tv-card-thumb" src="data:image/png;base64,{b64}" />'
-        f'<div class="tv-card-content">'
-        f'<div class="tv-card-top">'
+        f'<div class="tv-card-row1">'
         f'<div class="tv-card-pid">{pid}</div>'
         f'<div class="tv-card-pill" style="background:{hex_color}18;color:{hex_color};">{label}</div>'
         f'</div>'
-        f'<div class="tv-card-score">{score} <span>/ 100</span></div>'
-        f'<div class="tv-card-bar-track">'
-        f'<div class="tv-card-bar-fill" style="width:{score}%;background:{hex_color};"></div>'
+        f'<div class="tv-card-row2">'
+        f'<div class="tv-card-score" style="color:{hex_color};">{score}</div>'
+        f'<div class="tv-card-score-sub">/ 100</div>'
+        f'</div>'
+        f'<div class="tv-card-track">'
+        f'<div class="tv-card-fill" style="width:{score}%;background:{hex_color};"></div>'
         f'</div>'
         f'<div class="tv-card-explanation">{explanation}</div>'
         f'<div class="tv-card-ts">{ts}</div>'
         f'{warn_block}'
-        f'</div>'
         f'</div>'
         f'</div>'
         f'</div>'
@@ -327,25 +333,6 @@ def _render_patient_card(patient: dict) -> None:
             )
 
 
-_SIGNAL_SHORT = {
-    "slumped_posture": "Posture",
-    "body_sway": "Sway",
-    "tripod_position": "Tripod",
-    "arm_drift": "Arm Drift",
-    "hands_near_throat": "Throat",
-    "facial_asymmetry": "Asym.",
-    "low_alertness": "Alert",
-}
-
-
-def _bar_color(v: float) -> str:
-    if v > 0.6:
-        return "#DC2626"
-    if v >= 0.3:
-        return "#D97706"
-    return "#16A34A"
-
-
 def _update_signal_bars(signal_slot, signals: dict) -> None:
     cells = ""
     for key in SIGNAL_KEYS:
@@ -354,11 +341,11 @@ def _update_signal_bars(signal_slot, signals: dict) -> None:
         label = _SIGNAL_SHORT.get(key, key)
         cells += (
             f'<div class="tv-signal-cell">'
-            f'<div class="tv-signal-cell-label">{label}</div>'
-            f'<div class="tv-signal-cell-bar">'
-            f'<div class="tv-signal-cell-fill" style="width:{int(v*100)}%;background:{color};"></div>'
+            f'<div class="tv-signal-lbl">{label}</div>'
+            f'<div class="tv-signal-track">'
+            f'<div class="tv-signal-fill" style="width:{int(v*100)}%;background:{color};"></div>'
             f'</div>'
-            f'<div class="tv-signal-cell-val" style="color:{color};">{v:.2f}</div>'
+            f'<div class="tv-signal-val" style="color:{color};">{v:.2f}</div>'
             f'</div>'
         )
     signal_slot.markdown(
@@ -517,7 +504,8 @@ def _animate_demo_feed(frame_slot, signal_slot, profile: dict) -> None:
 def _sidebar_controls() -> tuple[str, int, str, list, float, bool, bool]:
     with st.sidebar:
         st.markdown(
-            '<div style="font-size:18px;font-weight:700;color:#0F172A;margin-bottom:12px;">Controls</div>',
+            '<div style="font-size:11px;font-weight:700;color:#64748B;'
+            'text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;">Controls</div>',
             unsafe_allow_html=True,
         )
         has_webcam = st.session_state.get("has_webcam", False)
@@ -543,7 +531,10 @@ def _sidebar_controls() -> tuple[str, int, str, list, float, bool, bool]:
                 accept_multiple_files=True,
             )
 
-        st.markdown('<div style="margin:8px 0 4px;border-top:1px solid #E2E8F0;"></div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div style="margin:10px 0 6px;border-top:1px solid #E2E8F0;"></div>',
+            unsafe_allow_html=True,
+        )
         c1, c2 = st.columns(2)
         load_demo = c1.button("Load Demo", type="secondary")
         clear_queue = c2.button("Clear Queue", type="secondary")
@@ -556,7 +547,7 @@ def _sidebar_controls() -> tuple[str, int, str, list, float, bool, bool]:
 
         st.markdown(
             '<div class="tv-build-note">'
-            "TriageVision MVP — rules-based signal extraction, weighted scoring, "
+            "SightLion MVP — rules-based signal extraction, weighted scoring, "
             "priority queue, live webcam, video playback, and demo mode."
             "</div>",
             unsafe_allow_html=True,
@@ -574,8 +565,8 @@ def _sidebar_controls() -> tuple[str, int, str, list, float, bool, bool]:
 
 
 def main() -> None:
-    """Render the TriageVision dashboard."""
-    st.set_page_config(page_title="TriageVision", layout="wide")
+    """Render the SightLion dashboard."""
+    st.set_page_config(page_title="SightLion", layout="wide")
     _inject_styles()
     _ensure_state()
 
@@ -603,16 +594,15 @@ def main() -> None:
         '<div class="tv-header">'
         '<div class="tv-cross">+</div>'
         "<div>"
-        '<div class="tv-header-title">TriageVision</div>'
+        '<div class="tv-header-title">SightLion</div>'
         '<div class="tv-header-sub">AI-assisted ER intake monitoring for staff review</div>'
         "</div>"
         "</div>",
         unsafe_allow_html=True,
     )
 
-    left_col, right_col = st.columns([1.55, 1.0], gap="medium")
+    left_col, right_col = st.columns([1.4, 1.0], gap="medium")
 
-    # ── Left: live feed ──────────────────────────────────────────────
     with left_col:
         st.markdown(
             '<div class="tv-disclaimer">⚠️ For staff review only. Not a diagnostic tool.</div>',
@@ -621,7 +611,10 @@ def main() -> None:
 
         use_webcam = mode == "Live Webcam" and has_webcam
         section_title = "Live Intake Monitor" if use_webcam else "Video Review"
-        st.markdown(f'<div class="tv-section-label">{section_title}</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="tv-section-label">{section_title}</div>',
+            unsafe_allow_html=True,
+        )
 
         frame_slot = st.empty()
         signal_slot = st.empty()
@@ -630,14 +623,19 @@ def main() -> None:
             st.markdown(
                 '<div class="tv-empty">'
                 '<div class="tv-empty-icon">📷</div>'
-                "No webcam detected.<br>Switch to <b>Video Upload</b> or load <b>Demo patients</b>."
+                "No webcam detected.<br>"
+                "Switch to <b>Video Upload</b> mode or press <b>Load Demo</b> to explore."
                 "</div>",
                 unsafe_allow_html=True,
             )
             _update_signal_bars(signal_slot, zero_signals())
 
         elif use_webcam:
-            start_capture = st.button("⏺  Start capture", type="primary")
+            _, btn_col, _ = st.columns([1, 2, 1])
+            with btn_col:
+                start_capture = st.button(
+                    "⏺  Start Capture", type="primary"
+                )
 
             if start_capture:
                 patient_id = _consume_patient_id(patient_override)
@@ -652,7 +650,11 @@ def main() -> None:
                 _preview_live_webcam(frame_slot, signal_slot)
 
         else:
-            analyze = st.button("▶  Play and analyze uploads", type="primary")
+            _, btn_col, _ = st.columns([1, 2, 1])
+            with btn_col:
+                analyze = st.button(
+                    "▶  Play & Analyze Uploads", type="primary"
+                )
 
             if analyze and uploaded_files:
                 with st.spinner("Playing uploads with landmark overlay..."):
@@ -678,7 +680,7 @@ def main() -> None:
                 st.markdown(
                     '<div class="tv-empty">'
                     '<div class="tv-empty-icon">🎬</div>'
-                    "Press <b>Play and analyze uploads</b> to begin."
+                    "Videos ready. Press <b>Play &amp; Analyze Uploads</b> to begin."
                     "</div>",
                     unsafe_allow_html=True,
                 )
@@ -692,7 +694,6 @@ def main() -> None:
                 )
                 _animate_demo_feed(frame_slot, signal_slot, selected_profile)
 
-    # ── Right: priority queue ────────────────────────────────────────
     with right_col:
         patients = sorted(
             st.session_state["patients"],
@@ -704,7 +705,7 @@ def main() -> None:
         st.markdown(
             f'<div class="tv-queue-header">'
             f'<div class="tv-queue-title">Priority Queue</div>'
-            f'<div class="tv-count-badge">{len(patients)}</div>'
+            f'<div class="tv-count-badge">{len(patients)} patient{"s" if len(patients) != 1 else ""}</div>'
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -713,8 +714,8 @@ def main() -> None:
             st.markdown(
                 '<div class="tv-empty">'
                 '<div class="tv-empty-icon">🏥</div>'
-                "No patients in queue.<br>"
-                "Start a capture, upload videos, or load demo patients."
+                "No patients in queue yet.<br>"
+                "Start a capture, upload videos, or press <b>Load Demo</b>."
                 "</div>",
                 unsafe_allow_html=True,
             )
@@ -724,9 +725,9 @@ def main() -> None:
 
         st.markdown(
             '<div class="tv-legend">'
-            '<span style="color:#DC2626;font-weight:700;">●</span> Critical ≥ 65 &nbsp;&nbsp;'
-            '<span style="color:#D97706;font-weight:700;">●</span> Urgent 35–64 &nbsp;&nbsp;'
-            '<span style="color:#16A34A;font-weight:700;">●</span> Stable &lt; 35'
+            '<span class="tv-legend-dot" style="color:#DC2626;">●</span> Critical ≥ 65 &nbsp;&nbsp;'
+            '<span class="tv-legend-dot" style="color:#D97706;">●</span> Urgent 35–64 &nbsp;&nbsp;'
+            '<span class="tv-legend-dot" style="color:#16A34A;">●</span> Stable &lt; 35'
             "</div>",
             unsafe_allow_html=True,
         )

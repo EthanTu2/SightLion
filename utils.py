@@ -1,4 +1,4 @@
-"""Utility helpers for TriageVision."""
+"""Utility helpers for SightLion."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ def create_placeholder_thumbnail(label: str, hex_color: str):
     rgb = _hex_to_rgb(hex_color)
     image[:, :] = rgb
 
-    initials = "".join(part[0] for part in label.split()[:2]).upper() or "TV"
+    initials = "".join(part[0] for part in label.split()[:2]).upper() or "SL"
     font = cv2.FONT_HERSHEY_SIMPLEX
     text_size, _ = cv2.getTextSize(initials, font, 0.7, 2)
     origin = ((80 - text_size[0]) // 2, (80 + text_size[1]) // 2)
@@ -71,7 +71,7 @@ def resize_thumbnail(image, size: tuple[int, int] = (80, 80)):
 def image_to_base64(image) -> str:
     """Encode a NumPy image into base64 for HTML rendering."""
     if image is None:
-        image = create_placeholder_thumbnail("TV", "#5B6474")
+        image = create_placeholder_thumbnail("SL", "#5B6474")
 
     bgr_image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     success, encoded = cv2.imencode(".png", bgr_image)
@@ -100,55 +100,65 @@ def draw_landmark_overlay(frame_bgr, pose_results, face_results) -> None:
         )
 
 
+def _score_bgr(score: int) -> tuple[int, int, int]:
+    if score >= 65:
+        return (38, 38, 220)
+    if score >= 35:
+        return (6, 119, 217)
+    return (74, 163, 22)
+
+
 def draw_signal_hud(frame_bgr, signals: dict, score: int, countdown_text: str | None = None) -> None:
     """Draw a semi-transparent live HUD panel with signal values."""
     overlay = frame_bgr.copy()
-    panel_width = 360
-    line_height = 34
-    panel_height = 56 + (len(signals) * line_height) + 60
-    cv2.rectangle(overlay, (14, 14), (14 + panel_width, 14 + panel_height), (10, 15, 25), -1)
-    cv2.addWeighted(overlay, 0.75, frame_bgr, 0.25, 0, frame_bgr)
+    panel_width = 370
+    line_height = 32
+    header_h = 52
+    footer_h = 70
+    panel_height = header_h + (len(signals) * line_height) + footer_h
+    x0, y0 = 14, 14
+    x1, y1 = x0 + panel_width, y0 + panel_height
 
-    cv2.rectangle(frame_bgr, (14, 14), (14 + panel_width, 14 + panel_height), (50, 60, 80), 1)
+    cv2.rectangle(overlay, (x0, y0), (x1, y1), (10, 15, 25), -1)
+    cv2.addWeighted(overlay, 0.80, frame_bgr, 0.20, 0, frame_bgr)
+    cv2.rectangle(frame_bgr, (x0, y0), (x1, y1), (60, 70, 90), 1)
 
-    cv2.putText(frame_bgr, "LIVE TRIAGE SIGNALS", (30, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (148, 163, 184), 2)
+    cv2.putText(frame_bgr, "LIVE TRIAGE SIGNALS", (30, 42),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (148, 163, 184), 1, cv2.LINE_AA)
+    cv2.line(frame_bgr, (30, 50), (x1 - 16, 50), (40, 50, 70), 1)
 
-    y_position = 80
+    y_pos = 74
     for signal_name, value in signals.items():
-        color = get_signal_bgr(float(value))
-        cv2.circle(frame_bgr, (34, y_position - 5), 8, color, -1)
-        cv2.putText(
-            frame_bgr,
-            f"{get_signal_label(signal_name)}: {float(value):.2f}",
-            (52, y_position),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.62,
-            color,
-            2,
-        )
-        y_position += line_height
+        v = float(value)
+        color = get_signal_bgr(v)
+        cv2.circle(frame_bgr, (34, y_pos - 4), 6, color, -1)
+        label_text = f"{get_signal_label(signal_name)}"
+        cv2.putText(frame_bgr, label_text, (50, y_pos),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (180, 190, 210), 1, cv2.LINE_AA)
+        val_text = f"{v:.2f}"
+        val_size, _ = cv2.getTextSize(val_text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+        cv2.putText(frame_bgr, val_text, (x1 - 22 - val_size[0], y_pos),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2, cv2.LINE_AA)
 
-    y_position += 4
-    cv2.putText(
-        frame_bgr,
-        f"Score: {score}",
-        (30, y_position + 8),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.0,
-        (255, 255, 255),
-        3,
-    )
+        bar_x0, bar_y0 = 50, y_pos + 6
+        bar_w = panel_width - 72
+        cv2.rectangle(frame_bgr, (bar_x0, bar_y0), (bar_x0 + bar_w, bar_y0 + 3), (40, 50, 70), -1)
+        fill_w = max(1, int(bar_w * v))
+        cv2.rectangle(frame_bgr, (bar_x0, bar_y0), (bar_x0 + fill_w, bar_y0 + 3), color, -1)
+
+        y_pos += line_height
+
+    cv2.line(frame_bgr, (30, y_pos + 2), (x1 - 16, y_pos + 2), (40, 50, 70), 1)
+
+    score_color = _score_bgr(score)
+    cv2.putText(frame_bgr, "SCORE", (30, y_pos + 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (148, 163, 184), 1, cv2.LINE_AA)
+    cv2.putText(frame_bgr, str(score), (100, y_pos + 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.95, score_color, 3, cv2.LINE_AA)
 
     if countdown_text:
-        cv2.putText(
-            frame_bgr,
-            countdown_text,
-            (30, y_position + 44),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.58,
-            (253, 224, 71),
-            2,
-        )
+        cv2.putText(frame_bgr, countdown_text, (30, y_pos + 52),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (253, 224, 71), 1, cv2.LINE_AA)
 
 
 def annotate_frame(frame_bgr, pose_results, face_results, signals: dict, score: int, countdown_text: str | None = None):
