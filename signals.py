@@ -24,15 +24,19 @@ except ImportError:
 FRAME_SAMPLE_RATE = 2
 MIN_VALID_FRAMES = 5
 
-SLUMPED_RATIO_THRESHOLD = 0.85
+POSTURE_UPRIGHT_RATIO = 0.50
+POSTURE_RANGE = 0.35
 BODY_SWAY_MAX_STD_PX = 50.0
-TRIPOD_Y_TOLERANCE_RATIO = 0.10
-ARM_DRIFT_THRESHOLD_RATIO = 0.15
+ARM_DRIFT_SCALE = 0.30
 THROAT_Y_RANGE_RATIO = 0.15
-THROAT_X_RANGE_RATIO = 0.20
+THROAT_X_RANGE_RATIO = 0.25
 THROAT_FRAME_FRACTION_THRESHOLD = 0.30
 FACIAL_ASYMMETRY_FACE_WIDTH_RATIO = 0.05
-LOW_ALERTNESS_EAR_THRESHOLD = 0.20
+EAR_OPEN_THRESHOLD = 0.28
+EAR_RANGE = 0.12
+
+_LEFT_EYE_LANDMARKS = (33, 160, 158, 133, 153, 144)
+_RIGHT_EYE_LANDMARKS = (263, 387, 385, 362, 380, 373)
 
 SIGNAL_KEYS = (
     "slumped_posture",
@@ -82,7 +86,7 @@ def create_face_mesh_estimator():
     return mp_face_mesh.FaceMesh(
         static_image_mode=False,
         max_num_faces=1,
-        refine_landmarks=False,
+        refine_landmarks=True,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     )
@@ -161,35 +165,44 @@ def _facial_asymmetry(face_landmarks, frame_w: int) -> float:
     return _clamp01(average_asymmetry / (face_width * FACIAL_ASYMMETRY_FACE_WIDTH_RATIO))
 
 
-def _eye_closed(face_landmarks) -> float:
-    upper = _face_xy(face_landmarks, 159)
-    lower = _face_xy(face_landmarks, 145)
-    outer = _face_xy(face_landmarks, 33)
-    inner = _face_xy(face_landmarks, 133)
+def _single_eye_ear(face_landmarks, indices: tuple) -> float:
+    """6-point Eye Aspect Ratio for one eye.
 
-    horizontal_distance = _euclidean(outer, inner)
-    if horizontal_distance == 0:
-        return 0.0
+    indices: (lateral, upper_lat, upper_med, medial, lower_med, lower_lat)
+    """
+    pts = [_face_xy(face_landmarks, i) for i in indices]
+    v1 = _euclidean(pts[1], pts[5])
+    v2 = _euclidean(pts[2], pts[4])
+    h = _euclidean(pts[0], pts[3])
+    if h == 0:
+        return 1.0
+    return (v1 + v2) / (2.0 * h)
 
-    eye_aspect_ratio = _euclidean(upper, lower) / horizontal_distance
-    return 1.0 if eye_aspect_ratio < LOW_ALERTNESS_EAR_THRESHOLD else 0.0
+
+def _low_alertness(face_landmarks) -> float:
+    """Continuous alertness score averaging both eyes."""
+    left_ear = _single_eye_ear(face_landmarks, _LEFT_EYE_LANDMARKS)
+    right_ear = _single_eye_ear(face_landmarks, _RIGHT_EYE_LANDMARKS)
+    avg_ear = (left_ear + right_ear) / 2.0
+    return _clamp01((EAR_OPEN_THRESHOLD - avg_ear) / EAR_RANGE)
 
 
 def _hands_near_throat(
-    left_wrist: tuple[float, float],
-    right_wrist: tuple[float, float],
+    hand_points: list[tuple[float, float]],
     nose_x: float,
     nose_y: float,
+    shoulder_mid_y: float,
     frame_w: int,
     frame_h: int,
 ) -> float:
     min_x = nose_x - (frame_w * THROAT_X_RANGE_RATIO)
     max_x = nose_x + (frame_w * THROAT_X_RANGE_RATIO)
     min_y = nose_y
-    max_y = nose_y + (frame_h * THROAT_Y_RANGE_RATIO)
+    throat_depth = (shoulder_mid_y - nose_y) * 0.75
+    max_y = nose_y + max(throat_depth, frame_h * THROAT_Y_RANGE_RATIO)
 
-    for wrist_x, wrist_y in (left_wrist, right_wrist):
-        if min_x <= wrist_x <= max_x and min_y <= wrist_y <= max_y:
+    for px, py in hand_points:
+        if min_x <= px <= max_x and min_y <= py <= max_y:
             return 1.0
     return 0.0
 
@@ -204,32 +217,58 @@ def analyze_landmarks(pose_landmarks, face_landmarks, frame_shape) -> Dict[str, 
     right_hip = _pose_px(pose_landmarks, mp_pose.PoseLandmark.RIGHT_HIP.value, frame_w, frame_h)
     left_wrist = _pose_px(pose_landmarks, mp_pose.PoseLandmark.LEFT_WRIST.value, frame_w, frame_h)
     right_wrist = _pose_px(pose_landmarks, mp_pose.PoseLandmark.RIGHT_WRIST.value, frame_w, frame_h)
-    left_knee = _pose_px(pose_landmarks, mp_pose.PoseLandmark.LEFT_KNEE.value, frame_w, frame_h)
-    right_knee = _pose_px(pose_landmarks, mp_pose.PoseLandmark.RIGHT_KNEE.value, frame_w, frame_h)
     nose_pose = _pose_px(pose_landmarks, mp_pose.PoseLandmark.NOSE.value, frame_w, frame_h)
+    left_index = _pose_px(pose_landmarks, mp_pose.PoseLandmark.LEFT_INDEX.value, frame_w, frame_h)
+    right_index = _pose_px(pose_landmarks, mp_pose.PoseLandmark.RIGHT_INDEX.value, frame_w, frame_h)
+    left_thumb = _pose_px(pose_landmarks, mp_pose.PoseLandmark.LEFT_THUMB.value, frame_w, frame_h)
+    right_thumb = _pose_px(pose_landmarks, mp_pose.PoseLandmark.RIGHT_THUMB.value, frame_w, frame_h)
 
     shoulder_mid_y = (left_shoulder[1] + right_shoulder[1]) / 2.0
     hip_mid_y = (left_hip[1] + right_hip[1]) / 2.0
-    knee_tolerance = frame_h * TRIPOD_Y_TOLERANCE_RATIO
-    wrist_delta_ratio = abs(left_wrist[1] - right_wrist[1]) / max(frame_h, 1)
+    shoulder_width = abs(left_shoulder[0] - right_shoulder[0])
+
+    torso_length = hip_mid_y - shoulder_mid_y
+    head_to_shoulder = shoulder_mid_y - nose_pose[1]
+
+    if torso_length > 0:
+        posture_ratio = head_to_shoulder / torso_length
+        slumped = _clamp01((POSTURE_UPRIGHT_RATIO - posture_ratio) / POSTURE_RANGE)
+    else:
+        posture_ratio = 1.0
+        slumped = 0.0
+
+    lean_score = _clamp01((0.42 - posture_ratio) / 0.22) if torso_length > 0 else 0.0
+    closest_wrist_hip = min(
+        abs(left_wrist[1] - hip_mid_y),
+        abs(right_wrist[1] - hip_mid_y),
+    )
+    brace_score = _clamp01(1.0 - closest_wrist_hip / (frame_h * 0.25))
+    tripod = lean_score * brace_score
+
+    wrist_delta = abs(left_wrist[1] - right_wrist[1])
+    ref_distance = max(shoulder_width, frame_h * 0.1)
+    arm_drift = _clamp01(wrist_delta / (ref_distance * ARM_DRIFT_SCALE))
+
+    hand_points = [
+        left_wrist, right_wrist,
+        left_index, right_index,
+        left_thumb, right_thumb,
+    ]
 
     return {
-        "slumped_posture": 1.0 if shoulder_mid_y > hip_mid_y * SLUMPED_RATIO_THRESHOLD else 0.0,
-        "tripod_position": 1.0
-        if abs(left_wrist[1] - left_knee[1]) <= knee_tolerance
-        and abs(right_wrist[1] - right_knee[1]) <= knee_tolerance
-        else 0.0,
-        "arm_drift": 1.0 if wrist_delta_ratio > ARM_DRIFT_THRESHOLD_RATIO else 0.0,
+        "slumped_posture": slumped,
+        "tripod_position": tripod,
+        "arm_drift": arm_drift,
         "hands_near_throat": _hands_near_throat(
-            left_wrist=left_wrist,
-            right_wrist=right_wrist,
+            hand_points=hand_points,
             nose_x=nose_pose[0],
             nose_y=nose_pose[1],
+            shoulder_mid_y=shoulder_mid_y,
             frame_w=frame_w,
             frame_h=frame_h,
         ),
         "facial_asymmetry": _facial_asymmetry(face_landmarks, frame_w),
-        "low_alertness": _eye_closed(face_landmarks),
+        "low_alertness": _low_alertness(face_landmarks),
         "nose_x": nose_pose[0],
     }
 

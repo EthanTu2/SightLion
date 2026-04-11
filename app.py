@@ -33,6 +33,8 @@ from utils import (
 PREVIEW_SECONDS = 3.0
 DEFAULT_CAPTURE_SECONDS = 10
 PLAYBACK_SPEEDS = {"0.5x": 0.5, "1x": 1.0, "2x": 2.0}
+CRITICAL_SCORE_THRESHOLD = 65
+CRITICAL_ALERT_SECONDS = 5.0
 
 _SIGNAL_SHORT = {
     "slumped_posture": "Posture",
@@ -130,8 +132,28 @@ def _inject_styles() -> None:
                 border-radius: 8px;
                 padding: 10px 2px 12px;
                 transition: box-shadow 0.15s;
+                position: relative;
             }
-            .tv-signal-cell:hover { box-shadow: 0 1px 4px rgba(0,0,0,0.06); }
+            .tv-signal-cell:hover { box-shadow: 0 1px 4px rgba(0,0,0,0.06); z-index: 10; }
+            .tv-signal-tip {
+                visibility: hidden; opacity: 0;
+                position: absolute; bottom: calc(100% + 8px); left: 50%;
+                transform: translateX(-50%);
+                background: var(--slate-900); color: #fff;
+                padding: 8px 12px; border-radius: 6px;
+                font-size: 11px; font-weight: 400; line-height: 1.45;
+                width: 185px; text-align: left;
+                text-transform: none; letter-spacing: normal;
+                pointer-events: none;
+                transition: opacity 0.15s, visibility 0.15s;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.18);
+            }
+            .tv-signal-tip::after {
+                content: ""; position: absolute; top: 100%; left: 50%;
+                transform: translateX(-50%);
+                border: 6px solid transparent; border-top-color: var(--slate-900);
+            }
+            .tv-signal-cell:hover .tv-signal-tip { visibility: visible; opacity: 1; }
             .tv-signal-lbl {
                 font-size: 9.5px; font-weight: 700; color: var(--slate-500);
                 text-transform: uppercase; letter-spacing: 0.4px;
@@ -274,6 +296,9 @@ def _ensure_state() -> None:
 
     default_mode = "Live Webcam" if st.session_state["has_webcam"] else "Video Upload"
     st.session_state.setdefault("selected_mode", default_mode)
+    st.session_state.setdefault("continuous_mode", False)
+    st.session_state.setdefault("monitoring_active", False)
+    st.session_state.setdefault("monitoring_data", None)
 
 
 def _consume_patient_id(override_value: str) -> str:
@@ -333,14 +358,27 @@ def _render_patient_card(patient: dict) -> None:
             )
 
 
+_SIGNAL_TIPS = {
+    "slumped_posture": "Measures head drop relative to torso length. Higher values indicate the patient is slumping forward.",
+    "body_sway": "Tracks lateral movement of the nose over time. Higher values indicate more postural instability.",
+    "tripod_position": "Detects forward lean combined with hands braced near the hips or knees \u2014 a sign of respiratory distress.",
+    "arm_drift": "Measures vertical asymmetry between left and right wrists. Higher values suggest one arm is drifting downward.",
+    "hands_near_throat": "Detects fingers or wrists in the throat/neck area across multiple frames.",
+    "facial_asymmetry": "Compares the symmetry of eye and mouth positions relative to the nose centerline.",
+    "low_alertness": "Monitors the Eye Aspect Ratio of both eyes. Higher values indicate the eyes are closing.",
+}
+
+
 def _update_signal_bars(signal_slot, signals: dict) -> None:
     cells = ""
     for key in SIGNAL_KEYS:
         v = float(signals.get(key, 0.0))
         color = _bar_color(v)
         label = _SIGNAL_SHORT.get(key, key)
+        tip = _SIGNAL_TIPS.get(key, "")
         cells += (
             f'<div class="tv-signal-cell">'
+            f'<div class="tv-signal-tip">{tip}</div>'
             f'<div class="tv-signal-lbl">{label}</div>'
             f'<div class="tv-signal-track">'
             f'<div class="tv-signal-fill" style="width:{int(v*100)}%;background:{color};"></div>'
@@ -458,6 +496,101 @@ def _preview_live_webcam(frame_slot, signal_slot) -> None:
         webcam.release()
 
 
+def _run_continuous_monitoring(frame_slot, signal_slot):
+    """Run continuous webcam monitoring with critical alert auto-save."""
+    webcam = cv2.VideoCapture(0)
+    if not webcam.isOpened():
+        st.session_state["monitoring_active"] = False
+        frame_slot.warning("Webcam unavailable.")
+        return
+
+    accumulator = SignalAccumulator()
+    latest_signals = zero_signals()
+    latest_rgb_frame = None
+    frame_index = 0
+    start_time = time.monotonic()
+    critical_start_time = None
+
+    try:
+        with create_pose_estimator() as pose, create_face_mesh_estimator() as face_mesh:
+            while True:
+                success, frame = webcam.read()
+                if not success:
+                    break
+
+                frame_index += 1
+                pose_results = None
+                face_results = None
+
+                if frame_index % FRAME_SAMPLE_RATE == 0:
+                    frame_signals, pose_results, face_results = process_frame(
+                        frame, pose, face_mesh
+                    )
+                    if frame_signals is not None:
+                        accumulator.add_frame(frame_signals)
+                        latest_signals = accumulator.current_signals()
+                        latest_rgb_frame = _frame_to_rgb(frame)
+
+                score = compute_score(latest_signals)
+
+                if score >= CRITICAL_SCORE_THRESHOLD:
+                    if critical_start_time is None:
+                        critical_start_time = time.monotonic()
+                    crit_dur = time.monotonic() - critical_start_time
+                    if crit_dur >= CRITICAL_ALERT_SECONDS:
+                        signals = accumulator.final_signals()
+                        thumbnail = (
+                            resize_thumbnail(latest_rgb_frame)
+                            if latest_rgb_frame is not None
+                            else None
+                        )
+                        pnum = int(st.session_state["next_patient_number"])
+                        st.session_state["next_patient_number"] = pnum + 1
+                        pid = f"Patient {pnum:03d}"
+                        record = build_patient_record(
+                            patient_id=pid, signals=signals, thumbnail=thumbnail
+                        )
+                        st.session_state["patients"].append(record)
+                        _notify(
+                            f"\U0001f6a8 CRITICAL ALERT — {pid} auto-saved "
+                            f"(score {score} for {CRITICAL_ALERT_SECONDS:.0f}s)"
+                        )
+                        accumulator = SignalAccumulator()
+                        latest_signals = zero_signals()
+                        critical_start_time = None
+                else:
+                    critical_start_time = None
+
+                elapsed = time.monotonic() - start_time
+                mins, secs = int(elapsed // 60), int(elapsed % 60)
+                status = f"Monitoring: {mins}:{secs:02d}"
+                if critical_start_time is not None:
+                    cd = time.monotonic() - critical_start_time
+                    status += f"  |  CRITICAL: {cd:.1f}s"
+
+                annotated = annotate_frame(
+                    frame, pose_results, face_results,
+                    latest_signals, score,
+                    countdown_text=status,
+                )
+
+                if critical_start_time is not None:
+                    h, w = annotated.shape[:2]
+                    pulse = 0.5 + 0.5 * math.sin(time.monotonic() * 6)
+                    color = (0, 0, int(255 * pulse))
+                    cv2.rectangle(annotated, (0, 0), (w - 1, h - 1), color, 6)
+
+                frame_slot.image(_frame_to_rgb(annotated), width="stretch")
+                _update_signal_bars(signal_slot, latest_signals)
+
+                st.session_state["monitoring_data"] = {
+                    "signals": accumulator.final_signals(),
+                    "thumbnail": latest_rgb_frame,
+                }
+    finally:
+        webcam.release()
+
+
 def _play_uploaded_video(
     frame_slot, signal_slot, video_path: str, patient_id: str, playback_speed: float
 ):
@@ -513,9 +646,13 @@ def _sidebar_controls() -> tuple[str, int, str, list, float, bool, bool]:
         if mode == "Live Webcam" and not has_webcam:
             st.warning("No webcam detected. Webcam features unavailable.")
 
-        capture_seconds = st.slider(
-            "Capture duration (s)", 5, 20, DEFAULT_CAPTURE_SECONDS, 1
-        )
+        continuous = st.checkbox("Continuous monitoring", key="continuous_mode")
+        if continuous:
+            capture_seconds = 0
+        else:
+            capture_seconds = st.slider(
+                "Capture duration (s)", 5, 60, DEFAULT_CAPTURE_SECONDS, 1
+            )
         patient_override = st.text_input(
             "Patient ID override", placeholder="Auto-assigned if blank"
         )
@@ -631,23 +768,70 @@ def main() -> None:
             _update_signal_bars(signal_slot, zero_signals())
 
         elif use_webcam:
-            _, btn_col, _ = st.columns([1, 2, 1])
-            with btn_col:
-                start_capture = st.button(
-                    "⏺  Start Capture", type="primary"
-                )
+            continuous = st.session_state.get("continuous_mode", False)
+            monitoring = st.session_state.get("monitoring_active", False)
 
-            if start_capture:
-                patient_id = _consume_patient_id(patient_override)
-                with st.spinner("Capturing webcam window..."):
-                    record = _capture_live_patient(
-                        frame_slot, signal_slot, patient_id, capture_seconds
-                    )
-                if record is not None:
-                    st.session_state["patients"].append(record)
-                    _notify(f"Added {record['patient_id']} to the queue.")
+            if not continuous and monitoring:
+                st.session_state["monitoring_active"] = False
+                st.session_state["monitoring_data"] = None
+                monitoring = False
+
+            if continuous:
+                _, btn_col, _ = st.columns([1, 2, 1])
+                with btn_col:
+                    if monitoring:
+                        stop_clicked = st.button(
+                            "\u23f9  Stop & Save", type="primary"
+                        )
+                    else:
+                        stop_clicked = False
+                        start_monitor = st.button(
+                            "\u25b6  Start Monitoring", type="primary"
+                        )
+
+                if monitoring and stop_clicked:
+                    st.session_state["monitoring_active"] = False
+                    data = st.session_state.get("monitoring_data")
+                    if data and data.get("signals"):
+                        pid = _consume_patient_id(patient_override)
+                        thumb = (
+                            resize_thumbnail(data["thumbnail"])
+                            if data.get("thumbnail") is not None
+                            else None
+                        )
+                        record = build_patient_record(
+                            patient_id=pid, signals=data["signals"], thumbnail=thumb
+                        )
+                        st.session_state["patients"].append(record)
+                        _notify(f"Saved {pid} to queue.")
+                    st.session_state["monitoring_data"] = None
+                    st.rerun()
+                elif monitoring:
+                    _run_continuous_monitoring(frame_slot, signal_slot)
+                elif start_monitor:
+                    st.session_state["monitoring_active"] = True
+                    st.session_state["monitoring_data"] = None
+                    st.rerun()
+                else:
+                    _preview_live_webcam(frame_slot, signal_slot)
             else:
-                _preview_live_webcam(frame_slot, signal_slot)
+                _, btn_col, _ = st.columns([1, 2, 1])
+                with btn_col:
+                    start_capture = st.button(
+                        "\u23fa  Start Capture", type="primary"
+                    )
+
+                if start_capture:
+                    patient_id = _consume_patient_id(patient_override)
+                    with st.spinner("Capturing webcam window..."):
+                        record = _capture_live_patient(
+                            frame_slot, signal_slot, patient_id, capture_seconds
+                        )
+                    if record is not None:
+                        st.session_state["patients"].append(record)
+                        _notify(f"Added {record['patient_id']} to the queue.")
+                else:
+                    _preview_live_webcam(frame_slot, signal_slot)
 
         else:
             _, btn_col, _ = st.columns([1, 2, 1])

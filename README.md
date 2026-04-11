@@ -36,7 +36,6 @@ pip install opencv-python mediapipe numpy streamlit
 ## Run
 
 ```bash
-cd triagevision
 streamlit run app.py
 ```
 
