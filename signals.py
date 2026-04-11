@@ -27,11 +27,11 @@ MIN_VALID_FRAMES = 5
 POSTURE_UPRIGHT_RATIO = 0.50
 POSTURE_RANGE = 0.35
 BODY_SWAY_MAX_STD_PX = 130.0
-ARM_DRIFT_SCALE = 0.30
+ARM_DRIFT_SCALE = 0.50
 THROAT_Y_RANGE_RATIO = 0.15
 THROAT_X_RANGE_RATIO = 0.25
 THROAT_FRAME_FRACTION_THRESHOLD = 0.30
-FACIAL_ASYMMETRY_FACE_WIDTH_RATIO = 0.20
+FACIAL_ASYMMETRY_FACE_WIDTH_RATIO = 0.35
 EAR_OPEN_THRESHOLD = 0.28
 EAR_RANGE = 0.12
 
@@ -82,10 +82,10 @@ def create_pose_estimator():
     )
 
 
-def create_face_mesh_estimator():
+def create_face_mesh_estimator(max_num_faces: int = 5):
     return mp_face_mesh.FaceMesh(
         static_image_mode=False,
-        max_num_faces=1,
+        max_num_faces=max_num_faces,
         refine_landmarks=True,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
@@ -288,6 +288,177 @@ def process_frame(frame_bgr, pose, face_mesh):
         frame_bgr.shape,
     )
     return frame_signals, pose_results, face_results
+
+
+def analyze_face_only(face_landmarks, frame_shape) -> Dict[str, float]:
+    """Compute face-only signals when no pose data is available for this person."""
+    frame_h, frame_w = frame_shape[:2]
+    nose_x = face_landmarks[1].x * frame_w
+    return {
+        "slumped_posture": 0.0,
+        "tripod_position": 0.0,
+        "arm_drift": 0.0,
+        "hands_near_throat": 0.0,
+        "facial_asymmetry": _facial_asymmetry(face_landmarks, frame_w),
+        "low_alertness": _low_alertness(face_landmarks),
+        "nose_x": nose_x,
+    }
+
+
+def _face_nose_px(face_landmarks, frame_w: int, frame_h: int) -> tuple[float, float]:
+    return face_landmarks[1].x * frame_w, face_landmarks[1].y * frame_h
+
+
+def process_frame_multi(frame_bgr, pose, face_mesh):
+    """Run MediaPipe for multi-person detection.
+
+    Returns:
+        per_face_data: list of {"face_center": (px_x, px_y), "signals": {...}}
+        pose_results: raw pose results for drawing
+        face_results: raw face results for drawing
+    """
+    rgb_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    pose_results = pose.process(rgb_frame)
+    face_results = face_mesh.process(rgb_frame)
+
+    if not face_results.multi_face_landmarks:
+        return [], pose_results, face_results
+
+    frame_h, frame_w = frame_bgr.shape[:2]
+
+    pose_nose = None
+    if pose_results.pose_landmarks:
+        nose_lm = pose_results.pose_landmarks.landmark[mp_pose.PoseLandmark.NOSE.value]
+        pose_nose = (nose_lm.x * frame_w, nose_lm.y * frame_h)
+
+    best_pose_face_idx = -1
+    if pose_nose is not None:
+        best_dist = float("inf")
+        for fi, face_lms in enumerate(face_results.multi_face_landmarks):
+            fn = _face_nose_px(face_lms.landmark, frame_w, frame_h)
+            dist = math.hypot(fn[0] - pose_nose[0], fn[1] - pose_nose[1])
+            if dist < best_dist:
+                best_dist = dist
+                best_pose_face_idx = fi
+        if best_dist > frame_w * 0.15:
+            best_pose_face_idx = -1
+
+    per_face_data: list[dict] = []
+    for fi, face_lms in enumerate(face_results.multi_face_landmarks):
+        face_center = _face_nose_px(face_lms.landmark, frame_w, frame_h)
+        if fi == best_pose_face_idx:
+            signals = analyze_landmarks(
+                pose_results.pose_landmarks.landmark,
+                face_lms.landmark,
+                frame_bgr.shape,
+            )
+        else:
+            signals = analyze_face_only(face_lms.landmark, frame_bgr.shape)
+        per_face_data.append({"face_center": face_center, "signals": signals})
+
+    return per_face_data, pose_results, face_results
+
+
+# ---------------------------------------------------------------------------
+# Multi-person tracker
+# ---------------------------------------------------------------------------
+
+class _PersonTrack:
+    __slots__ = ("person_id", "face_center", "accumulator", "last_seen")
+
+    def __init__(self, person_id: int, face_center: tuple[float, float], frame_index: int):
+        self.person_id = person_id
+        self.face_center = face_center
+        self.accumulator = SignalAccumulator()
+        self.last_seen = frame_index
+
+
+class MultiPersonTracker:
+    """Track multiple people across frames using face-position matching."""
+
+    MAX_MATCH_DISTANCE = 150.0
+    STALE_FRAME_LIMIT = 45
+
+    def __init__(self) -> None:
+        self._tracks: dict[int, _PersonTrack] = {}
+        self._next_id = 1
+
+    def update(self, per_face_data: list[dict], frame_index: int) -> list[dict]:
+        """Match detected faces to tracks and update accumulators.
+
+        Returns list of {"person_id", "face_center", "signals"} sorted by id.
+        """
+        used_tracks: set[int] = set()
+        used_faces: set[int] = set()
+
+        pairs: list[tuple[float, int, int]] = []
+        for fi, face in enumerate(per_face_data):
+            for tid, track in self._tracks.items():
+                dist = math.hypot(
+                    face["face_center"][0] - track.face_center[0],
+                    face["face_center"][1] - track.face_center[1],
+                )
+                pairs.append((dist, fi, tid))
+        pairs.sort()
+
+        for dist, fi, tid in pairs:
+            if fi in used_faces or tid in used_tracks:
+                continue
+            if dist > self.MAX_MATCH_DISTANCE:
+                continue
+            track = self._tracks[tid]
+            track.face_center = per_face_data[fi]["face_center"]
+            track.last_seen = frame_index
+            track.accumulator.add_frame(per_face_data[fi]["signals"])
+            used_faces.add(fi)
+            used_tracks.add(tid)
+
+        for fi in range(len(per_face_data)):
+            if fi in used_faces:
+                continue
+            pid = self._next_id
+            self._next_id += 1
+            face = per_face_data[fi]
+            track = _PersonTrack(pid, face["face_center"], frame_index)
+            track.accumulator.add_frame(face["signals"])
+            self._tracks[pid] = track
+
+        stale = [
+            tid
+            for tid, t in self._tracks.items()
+            if frame_index - t.last_seen > self.STALE_FRAME_LIMIT
+        ]
+        for tid in stale:
+            del self._tracks[tid]
+
+        return [
+            {
+                "person_id": tid,
+                "face_center": track.face_center,
+                "signals": track.accumulator.current_signals(),
+            }
+            for tid, track in sorted(self._tracks.items())
+        ]
+
+    def get_all_final(self) -> list[dict]:
+        """Get final signals for all tracked people."""
+        return [
+            {"person_id": tid, "signals": t.accumulator.final_signals()}
+            for tid, t in sorted(self._tracks.items())
+        ]
+
+    def get_person_final_and_reset(self, person_id: int) -> dict | None:
+        """Get final signals for one person and reset their accumulator."""
+        track = self._tracks.get(person_id)
+        if track is None:
+            return None
+        signals = track.accumulator.final_signals()
+        track.accumulator.reset()
+        return signals
+
+    @property
+    def track_count(self) -> int:
+        return len(self._tracks)
 
 
 def extract_signals(video_path: str) -> Dict[str, float]:

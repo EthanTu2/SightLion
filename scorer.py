@@ -18,6 +18,10 @@ CLINICAL_HIGH = 0.50
 CLINICAL_MODERATE = 0.25
 CLINICAL_FINDING = 0.30
 
+STROKE_HIGH = 0.65
+STROKE_MODERATE = 0.40
+STROKE_FINDING = 0.45
+
 
 def compute_score(signals: dict) -> int:
     """Convert signal values into a weighted 0-100 severity score."""
@@ -51,13 +55,13 @@ def derive_stroke_risk(signals: dict) -> dict:
     drift = float(signals.get("arm_drift", 0))
     peak = max(asym, drift)
     findings: list[str] = []
-    if asym > CLINICAL_FINDING:
+    if asym > STROKE_FINDING:
         findings.append("Facial droop detected")
-    if drift > CLINICAL_FINDING:
+    if drift > STROKE_FINDING:
         findings.append("Arm weakness detected")
-    if peak > CLINICAL_HIGH:
+    if peak > STROKE_HIGH:
         level = "HIGH"
-    elif peak > CLINICAL_MODERATE:
+    elif peak > STROKE_MODERATE:
         level = "MODERATE"
     else:
         level = "LOW"

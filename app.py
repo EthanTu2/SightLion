@@ -21,10 +21,10 @@ from scorer import (
 from signals import (
     FRAME_SAMPLE_RATE,
     SIGNAL_KEYS,
-    SignalAccumulator,
+    MultiPersonTracker,
     create_face_mesh_estimator,
     create_pose_estimator,
-    process_frame,
+    process_frame_multi,
     zero_signals,
 )
 from utils import (
@@ -61,6 +61,25 @@ def _level_css_color(level: str) -> str:
     if level in ("MODERATE", "Drowsy"):
         return "#D97706"
     return "#16A34A"
+
+
+def _enrich_person_states(raw_tracks: list[dict]) -> list[dict]:
+    """Add score, assessments, hex, and label to raw tracker output."""
+    enriched = []
+    for t in raw_tracks:
+        signals = t["signals"]
+        score = compute_score(signals)
+        priority = get_priority(score)
+        assessments = derive_clinical_assessments(signals)
+        enriched.append({
+            **t,
+            "label": f"P{t['person_id']:02d}",
+            "score": score,
+            "hex": priority["hex"],
+            "priority_label": priority["label"],
+            "assessments": assessments,
+        })
+    return enriched
 
 
 def _inject_styles() -> None:
@@ -197,6 +216,10 @@ def _inject_styles() -> None:
             }
             .tv-score-tile-sub {
                 font-size: 11px; font-weight: 600; margin-top: 2px;
+            }
+            .tv-score-tile-track {
+                font-size: 9px; font-weight: 600; color: var(--slate-400);
+                margin-top: 4px;
             }
 
             /* ── Queue header ───────────────────────────── */
@@ -359,11 +382,19 @@ def _consume_patient_id(override_value: str) -> str:
 # Clinical assessment tiles (below the video)
 # ---------------------------------------------------------------------------
 
-def _update_assess_tiles(slot, signals: dict) -> None:
+def _update_assess_tiles(slot, person_states: list[dict]) -> None:
     """Render clinical assessment tiles + severity score below the live feed."""
-    assessments = derive_clinical_assessments(signals)
-    score = compute_score(signals)
-    priority = get_priority(score)
+    if person_states:
+        worst = max(person_states, key=lambda p: p["score"])
+        assessments = worst["assessments"]
+        score = worst["score"]
+        priority = get_priority(score)
+        n_tracked = len(person_states)
+    else:
+        assessments = derive_clinical_assessments(zero_signals())
+        score = 0
+        priority = get_priority(0)
+        n_tracked = 0
 
     cells = ""
     for key in ("stroke_risk", "fall_risk", "respiratory", "mental_status"):
@@ -388,11 +419,19 @@ def _update_assess_tiles(slot, signals: dict) -> None:
 
     score_color = priority["hex"]
     score_label = priority["label"]
+    track_note = ""
+    if n_tracked > 1:
+        track_note = (
+            f'<div class="tv-score-tile-track">'
+            f'\U0001f465 {n_tracked} people tracked'
+            f'</div>'
+        )
     cells += (
         f'<div class="tv-score-tile">'
         f'<div class="tv-score-tile-label">SEVERITY</div>'
         f'<div class="tv-score-tile-value" style="color:{score_color};">{score}</div>'
         f'<div class="tv-score-tile-sub" style="color:{score_color};">{html.escape(score_label)}</div>'
+        f'{track_note}'
         f'</div>'
     )
 
@@ -486,8 +525,9 @@ def _stream_capture_loop(
     playback_speed: float = 1.0,
     countdown_prefix: str | None = None,
 ):
-    accumulator = SignalAccumulator()
-    latest_signals = zero_signals()
+    """Multi-person capture loop. Returns (all_final, latest_rgb_frame)."""
+    tracker = MultiPersonTracker()
+    person_states: list[dict] = []
     latest_rgb_frame = None
     start_time = time.monotonic()
     frame_index = 0
@@ -512,12 +552,12 @@ def _stream_capture_loop(
             face_results = None
 
             if frame_index % FRAME_SAMPLE_RATE == 0:
-                frame_signals, pose_results, face_results = process_frame(
+                per_face_data, pose_results, face_results = process_frame_multi(
                     frame, pose, face_mesh
                 )
-                if frame_signals is not None:
-                    accumulator.add_frame(frame_signals)
-                    latest_signals = accumulator.current_signals()
+                raw_tracks = tracker.update(per_face_data, frame_index)
+                person_states = _enrich_person_states(raw_tracks)
+                if per_face_data:
                     latest_rgb_frame = _frame_to_rgb(frame)
 
             countdown_text = None
@@ -529,25 +569,27 @@ def _stream_capture_loop(
                 frame,
                 pose_results,
                 face_results,
-                latest_signals,
-                compute_score(latest_signals),
+                person_states,
                 countdown_text=countdown_text,
             )
             frame_slot.image(_frame_to_rgb(annotated), width="stretch")
-            _update_assess_tiles(signal_slot, latest_signals)
+            _update_assess_tiles(signal_slot, person_states)
 
             if sleep_seconds > 0:
                 time.sleep(sleep_seconds)
 
-    return accumulator.final_signals(), latest_rgb_frame
+    return tracker.get_all_final(), latest_rgb_frame
 
 
-def _capture_live_patient(frame_slot, signal_slot, patient_id: str, capture_seconds: int):
+def _capture_live_patients(
+    frame_slot, signal_slot, patient_override: str, capture_seconds: int
+) -> list[dict]:
+    """Capture from webcam and return patient records for all tracked people."""
     webcam = cv2.VideoCapture(0)
     if not webcam.isOpened():
-        return None
+        return []
     try:
-        signals, latest_rgb_frame = _stream_capture_loop(
+        all_final, latest_rgb_frame = _stream_capture_loop(
             webcam,
             frame_slot,
             signal_slot,
@@ -556,8 +598,16 @@ def _capture_live_patient(frame_slot, signal_slot, patient_id: str, capture_seco
         )
     finally:
         webcam.release()
+
     thumbnail = resize_thumbnail(latest_rgb_frame) if latest_rgb_frame is not None else None
-    return build_patient_record(patient_id=patient_id, signals=signals, thumbnail=thumbnail)
+    records: list[dict] = []
+    for i, pdata in enumerate(all_final):
+        override = patient_override if len(all_final) == 1 else ""
+        pid = _consume_patient_id(override)
+        records.append(
+            build_patient_record(patient_id=pid, signals=pdata["signals"], thumbnail=thumbnail)
+        )
+    return records
 
 
 def _preview_live_webcam(frame_slot, signal_slot) -> None:
@@ -578,19 +628,19 @@ def _preview_live_webcam(frame_slot, signal_slot) -> None:
 
 
 def _run_continuous_monitoring(frame_slot, signal_slot):
-    """Run continuous webcam monitoring with critical alert auto-save."""
+    """Run continuous webcam monitoring with per-person critical alert auto-save."""
     webcam = cv2.VideoCapture(0)
     if not webcam.isOpened():
         st.session_state["monitoring_active"] = False
         frame_slot.warning("Webcam unavailable.")
         return
 
-    accumulator = SignalAccumulator()
-    latest_signals = zero_signals()
+    tracker = MultiPersonTracker()
+    person_states: list[dict] = []
     latest_rgb_frame = None
     frame_index = 0
     start_time = time.monotonic()
-    critical_start_time = None
+    critical_timers: dict[int, float | None] = {}
 
     try:
         with create_pose_estimator() as pose, create_face_mesh_estimator() as face_mesh:
@@ -604,68 +654,78 @@ def _run_continuous_monitoring(frame_slot, signal_slot):
                 face_results = None
 
                 if frame_index % FRAME_SAMPLE_RATE == 0:
-                    frame_signals, pose_results, face_results = process_frame(
+                    per_face_data, pose_results, face_results = process_frame_multi(
                         frame, pose, face_mesh
                     )
-                    if frame_signals is not None:
-                        accumulator.add_frame(frame_signals)
-                        latest_signals = accumulator.current_signals()
+                    raw_tracks = tracker.update(per_face_data, frame_index)
+                    person_states = _enrich_person_states(raw_tracks)
+                    if per_face_data:
                         latest_rgb_frame = _frame_to_rgb(frame)
 
-                score = compute_score(latest_signals)
+                any_critical = False
+                for ps in person_states:
+                    pid = ps["person_id"]
+                    score = ps["score"]
+                    if score >= CRITICAL_SCORE_THRESHOLD:
+                        if critical_timers.get(pid) is None:
+                            critical_timers[pid] = time.monotonic()
+                        crit_dur = time.monotonic() - critical_timers[pid]
+                        if crit_dur >= CRITICAL_ALERT_SECONDS:
+                            person_signals = tracker.get_person_final_and_reset(pid)
+                            if person_signals:
+                                thumb = (
+                                    resize_thumbnail(latest_rgb_frame)
+                                    if latest_rgb_frame is not None
+                                    else None
+                                )
+                                pnum = int(st.session_state["next_patient_number"])
+                                st.session_state["next_patient_number"] = pnum + 1
+                                patient_id = f"Patient {pnum:03d}"
+                                record = build_patient_record(
+                                    patient_id=patient_id,
+                                    signals=person_signals,
+                                    thumbnail=thumb,
+                                )
+                                st.session_state["patients"].append(record)
+                                _notify(
+                                    f"\U0001f6a8 CRITICAL ALERT \u2014 {patient_id} "
+                                    f"(P{pid:02d}) auto-saved (score {score} "
+                                    f"for {CRITICAL_ALERT_SECONDS:.0f}s)"
+                                )
+                            critical_timers[pid] = None
+                        any_critical = True
+                    else:
+                        critical_timers[pid] = None
 
-                if score >= CRITICAL_SCORE_THRESHOLD:
-                    if critical_start_time is None:
-                        critical_start_time = time.monotonic()
-                    crit_dur = time.monotonic() - critical_start_time
-                    if crit_dur >= CRITICAL_ALERT_SECONDS:
-                        signals = accumulator.final_signals()
-                        thumbnail = (
-                            resize_thumbnail(latest_rgb_frame)
-                            if latest_rgb_frame is not None
-                            else None
-                        )
-                        pnum = int(st.session_state["next_patient_number"])
-                        st.session_state["next_patient_number"] = pnum + 1
-                        pid = f"Patient {pnum:03d}"
-                        record = build_patient_record(
-                            patient_id=pid, signals=signals, thumbnail=thumbnail
-                        )
-                        st.session_state["patients"].append(record)
-                        _notify(
-                            f"\U0001f6a8 CRITICAL ALERT \u2014 {pid} auto-saved "
-                            f"(score {score} for {CRITICAL_ALERT_SECONDS:.0f}s)"
-                        )
-                        accumulator = SignalAccumulator()
-                        latest_signals = zero_signals()
-                        critical_start_time = None
-                else:
-                    critical_start_time = None
+                tracked_ids = {ps["person_id"] for ps in person_states}
+                critical_timers = {k: v for k, v in critical_timers.items() if k in tracked_ids}
 
                 elapsed = time.monotonic() - start_time
                 mins, secs = int(elapsed // 60), int(elapsed % 60)
                 status = f"Monitoring: {mins}:{secs:02d}"
-                if critical_start_time is not None:
-                    cd = time.monotonic() - critical_start_time
-                    status += f"  |  CRITICAL: {cd:.1f}s"
+                if any_critical:
+                    max_crit = max(
+                        (time.monotonic() - t for t in critical_timers.values() if t is not None),
+                        default=0.0,
+                    )
+                    status += f"  |  CRITICAL: {max_crit:.1f}s"
 
                 annotated = annotate_frame(
                     frame, pose_results, face_results,
-                    latest_signals, score,
-                    countdown_text=status,
+                    person_states, countdown_text=status,
                 )
 
-                if critical_start_time is not None:
+                if any_critical:
                     h, w = annotated.shape[:2]
                     pulse = 0.5 + 0.5 * math.sin(time.monotonic() * 6)
                     color = (0, 0, int(255 * pulse))
                     cv2.rectangle(annotated, (0, 0), (w - 1, h - 1), color, 6)
 
                 frame_slot.image(_frame_to_rgb(annotated), width="stretch")
-                _update_assess_tiles(signal_slot, latest_signals)
+                _update_assess_tiles(signal_slot, person_states)
 
                 st.session_state["monitoring_data"] = {
-                    "signals": accumulator.final_signals(),
+                    "all_final": tracker.get_all_final(),
                     "thumbnail": latest_rgb_frame,
                 }
     finally:
@@ -673,11 +733,12 @@ def _run_continuous_monitoring(frame_slot, signal_slot):
 
 
 def _play_uploaded_video(
-    frame_slot, signal_slot, video_path: str, patient_id: str, playback_speed: float
-):
+    frame_slot, signal_slot, video_path: str, playback_speed: float
+) -> tuple[list[dict], None]:
+    """Play an uploaded video and return (all_final, latest_rgb_frame)."""
     capture = cv2.VideoCapture(video_path)
     try:
-        signals, latest_rgb_frame = _stream_capture_loop(
+        all_final, latest_rgb_frame = _stream_capture_loop(
             capture,
             frame_slot,
             signal_slot,
@@ -686,8 +747,7 @@ def _play_uploaded_video(
         )
     finally:
         capture.release()
-    thumbnail = resize_thumbnail(latest_rgb_frame) if latest_rgb_frame is not None else None
-    return build_patient_record(patient_id=patient_id, signals=signals, thumbnail=thumbnail)
+    return all_final, latest_rgb_frame
 
 
 def _animate_demo_feed(frame_slot, signal_slot, profile: dict) -> None:
@@ -706,12 +766,25 @@ def _animate_demo_feed(frame_slot, signal_slot, profile: dict) -> None:
             base = float(base_signals.get(key, 0.0))
             animated_signals[key] = max(0.0, min(1.0, base + 0.04 * math.sin(phase + offset)))
 
+        score = compute_score(animated_signals)
+        priority = get_priority(score)
+        person_states = [{
+            "person_id": 0,
+            "label": profile["patient_id"],
+            "face_center": (480, 230),
+            "signals": animated_signals,
+            "score": score,
+            "hex": priority["hex"],
+            "priority_label": priority["label"],
+            "assessments": derive_clinical_assessments(animated_signals),
+        }]
+
         frame = create_demo_frame(profile["patient_id"], hex_color, phase)
         annotated = annotate_frame(
-            frame, None, None, animated_signals, profile["score"], countdown_text="Demo feed"
+            frame, None, None, person_states, countdown_text="Demo feed"
         )
         frame_slot.image(_frame_to_rgb(annotated), width="stretch")
-        _update_assess_tiles(signal_slot, animated_signals)
+        _update_assess_tiles(signal_slot, person_states)
         time.sleep(0.04)
 
 
@@ -769,8 +842,8 @@ def _sidebar_controls() -> tuple[str, int, str, list, float, bool, bool]:
 
         st.markdown(
             '<div class="tv-build-note">'
-            "SightLion \u2014 AI-assisted ER intake triage with clinical assessments, "
-            "severity scoring, and priority queue."
+            "SightLion \u2014 AI-assisted ER intake triage with multi-person clinical "
+            "assessments, severity scoring, and priority queue."
             "</div>",
             unsafe_allow_html=True,
         )
@@ -854,7 +927,7 @@ def main() -> None:
                 "</div>",
                 unsafe_allow_html=True,
             )
-            _update_assess_tiles(signal_slot, zero_signals())
+            _update_assess_tiles(signal_slot, [])
 
         elif use_webcam:
             continuous = st.session_state.get("continuous_mode", False)
@@ -881,18 +954,22 @@ def main() -> None:
                 if monitoring and stop_clicked:
                     st.session_state["monitoring_active"] = False
                     data = st.session_state.get("monitoring_data")
-                    if data and data.get("signals"):
-                        pid = _consume_patient_id(patient_override)
-                        thumb = (
-                            resize_thumbnail(data["thumbnail"])
-                            if data.get("thumbnail") is not None
-                            else None
+                    if data and data.get("all_final"):
+                        for pdata in data["all_final"]:
+                            override = patient_override if len(data["all_final"]) == 1 else ""
+                            pid = _consume_patient_id(override)
+                            thumb = (
+                                resize_thumbnail(data["thumbnail"])
+                                if data.get("thumbnail") is not None
+                                else None
+                            )
+                            record = build_patient_record(
+                                patient_id=pid, signals=pdata["signals"], thumbnail=thumb
+                            )
+                            st.session_state["patients"].append(record)
+                        _notify(
+                            f"Saved {len(data['all_final'])} patient(s) to queue."
                         )
-                        record = build_patient_record(
-                            patient_id=pid, signals=data["signals"], thumbnail=thumb
-                        )
-                        st.session_state["patients"].append(record)
-                        _notify(f"Saved {pid} to queue.")
                     st.session_state["monitoring_data"] = None
                     st.rerun()
                 elif monitoring:
@@ -911,14 +988,14 @@ def main() -> None:
                     )
 
                 if start_capture:
-                    patient_id = _consume_patient_id(patient_override)
                     with st.spinner("Capturing webcam window..."):
-                        record = _capture_live_patient(
-                            frame_slot, signal_slot, patient_id, capture_seconds
+                        records = _capture_live_patients(
+                            frame_slot, signal_slot, patient_override, capture_seconds
                         )
-                    if record is not None:
+                    for record in records:
                         st.session_state["patients"].append(record)
-                        _notify(f"Added {record['patient_id']} to the queue.")
+                    if records:
+                        _notify(f"Added {len(records)} patient(s) to the queue.")
                 else:
                     _preview_live_webcam(frame_slot, signal_slot)
 
@@ -937,13 +1014,27 @@ def main() -> None:
                             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
                                 f.write(uf.getbuffer())
                                 tmp = f.name
-                            pid = _consume_patient_id(
-                                patient_override if len(uploaded_files) == 1 else ""
+                            all_final, latest_rgb_frame = _play_uploaded_video(
+                                frame_slot, signal_slot, tmp, playback_speed
                             )
-                            rec = _play_uploaded_video(
-                                frame_slot, signal_slot, tmp, pid, playback_speed
+                            thumb = (
+                                resize_thumbnail(latest_rgb_frame)
+                                if latest_rgb_frame is not None
+                                else None
                             )
-                            st.session_state["patients"].append(rec)
+                            for pdata in all_final:
+                                override = (
+                                    patient_override
+                                    if len(uploaded_files) == 1 and len(all_final) == 1
+                                    else ""
+                                )
+                                pid = _consume_patient_id(override)
+                                rec = build_patient_record(
+                                    patient_id=pid,
+                                    signals=pdata["signals"],
+                                    thumbnail=thumb,
+                                )
+                                st.session_state["patients"].append(rec)
                         finally:
                             if tmp and os.path.exists(tmp):
                                 os.remove(tmp)
@@ -957,7 +1048,7 @@ def main() -> None:
                     "</div>",
                     unsafe_allow_html=True,
                 )
-                _update_assess_tiles(signal_slot, zero_signals())
+                _update_assess_tiles(signal_slot, [])
 
             else:
                 selected_profile = next(

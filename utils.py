@@ -61,13 +61,14 @@ def image_to_base64(image) -> str:
 def draw_landmark_overlay(frame_bgr, pose_results, face_results) -> None:
     """Draw MediaPipe face mesh and pose landmarks onto a BGR frame."""
     if face_results and getattr(face_results, "multi_face_landmarks", None):
-        mp_drawing.draw_landmarks(
-            frame_bgr,
-            face_results.multi_face_landmarks[0],
-            mp_face_mesh.FACEMESH_TESSELATION,
-            landmark_drawing_spec=None,
-            connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_tesselation_style(),
-        )
+        for face_landmarks in face_results.multi_face_landmarks:
+            mp_drawing.draw_landmarks(
+                frame_bgr,
+                face_landmarks,
+                mp_face_mesh.FACEMESH_TESSELATION,
+                landmark_drawing_spec=None,
+                connection_drawing_spec=mp_drawing_styles.get_default_face_mesh_tesselation_style(),
+            )
 
     if pose_results and getattr(pose_results, "pose_landmarks", None):
         mp_drawing.draw_landmarks(
@@ -75,6 +76,43 @@ def draw_landmark_overlay(frame_bgr, pose_results, face_results) -> None:
             pose_results.pose_landmarks,
             mp_pose.POSE_CONNECTIONS,
             landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style(),
+        )
+
+
+def draw_person_labels(frame_bgr, person_states: list[dict]) -> None:
+    """Draw patient labels above each tracked person's face."""
+    for person in person_states:
+        cx = int(person["face_center"][0])
+        cy = int(person["face_center"][1])
+        label = person["label"]
+        bgr = _hex_to_bgr(person["hex"])
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.7
+        thickness = 2
+        text_size, _ = cv2.getTextSize(label, font, scale, thickness)
+
+        label_y = cy - 75
+        label_x = cx - text_size[0] // 2
+        pad = 8
+
+        cv2.rectangle(
+            frame_bgr,
+            (label_x - pad, label_y - text_size[1] - pad),
+            (label_x + text_size[0] + pad, label_y + pad + 2),
+            bgr,
+            -1,
+        )
+        cv2.rectangle(
+            frame_bgr,
+            (label_x - pad, label_y - text_size[1] - pad),
+            (label_x + text_size[0] + pad, label_y + pad + 2),
+            (255, 255, 255),
+            1,
+        )
+        cv2.putText(
+            frame_bgr, label, (label_x, label_y),
+            font, scale, (255, 255, 255), thickness, cv2.LINE_AA,
         )
 
 
@@ -110,6 +148,7 @@ def draw_clinical_hud(
     assessments: dict,
     score: int,
     countdown_text: str | None = None,
+    track_count: int = 0,
 ) -> None:
     """Draw a clinical-assessment HUD panel on the video frame."""
     overlay = frame_bgr.copy()
@@ -122,6 +161,8 @@ def draw_clinical_hud(
 
     total_findings = sum(len(a.get("findings", [])) for a in assessments.values())
     panel_height = header_h + (len(_HUD_ASSESS_ORDER) * line_height) + (total_findings * findings_lh) + footer_h
+    if track_count > 1:
+        panel_height += 24
     x1, y1 = x0 + panel_width, y0 + panel_height
 
     cv2.rectangle(overlay, (x0, y0), (x1, y1), (10, 15, 25), -1)
@@ -134,7 +175,7 @@ def draw_clinical_hud(
 
     y_pos = 72
     for key, label in _HUD_ASSESS_ORDER:
-        a = assessments.get(key, {"level": "—", "findings": []})
+        a = assessments.get(key, {"level": "\u2014", "findings": []})
         level = a["level"]
         color = _LEVEL_BGR.get(level, (148, 163, 184))
 
@@ -162,8 +203,18 @@ def draw_clinical_hud(
     cv2.putText(frame_bgr, "/ 100", (112 + score_w[0] + 4, y_pos + 22),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 130, 150), 1, cv2.LINE_AA)
 
+    footer_y = y_pos + 40
+    if track_count > 1:
+        cv2.putText(
+            frame_bgr,
+            f"Tracking {track_count} people",
+            (30, footer_y),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (100, 200, 255), 1, cv2.LINE_AA,
+        )
+        footer_y += 24
+
     if countdown_text:
-        cv2.putText(frame_bgr, countdown_text, (30, y_pos + 46),
+        cv2.putText(frame_bgr, countdown_text, (30, footer_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (253, 224, 71), 1, cv2.LINE_AA)
 
 
@@ -171,17 +222,26 @@ def annotate_frame(
     frame_bgr,
     pose_results,
     face_results,
-    signals: dict,
-    score: int,
+    person_states: list[dict],
     countdown_text: str | None = None,
 ):
-    """Return a BGR frame with landmarks and clinical HUD annotations."""
+    """Return a BGR frame with landmarks, person labels, and clinical HUD."""
     from scorer import derive_clinical_assessments
 
     annotated = frame_bgr.copy()
     draw_landmark_overlay(annotated, pose_results, face_results)
-    assessments = derive_clinical_assessments(signals)
-    draw_clinical_hud(annotated, assessments, score, countdown_text=countdown_text)
+
+    if person_states:
+        draw_person_labels(annotated, person_states)
+        worst = max(person_states, key=lambda p: p["score"])
+        draw_clinical_hud(
+            annotated, worst["assessments"], worst["score"],
+            countdown_text, track_count=len(person_states),
+        )
+    else:
+        empty = derive_clinical_assessments({})
+        draw_clinical_hud(annotated, empty, 0, countdown_text)
+
     return annotated
 
 
