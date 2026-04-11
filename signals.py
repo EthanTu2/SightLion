@@ -343,7 +343,7 @@ def process_frame_multi(frame_bgr, pose, face_mesh):
         if best_dist > frame_w * 0.15:
             best_pose_face_idx = -1
 
-    per_face_data: list[dict] = []
+    raw_faces: list[dict] = []
     for fi, face_lms in enumerate(face_results.multi_face_landmarks):
         face_center = _face_nose_px(face_lms.landmark, frame_w, frame_h)
         if fi == best_pose_face_idx:
@@ -354,9 +354,36 @@ def process_frame_multi(frame_bgr, pose, face_mesh):
             )
         else:
             signals = analyze_face_only(face_lms.landmark, frame_bgr.shape)
-        per_face_data.append({"face_center": face_center, "signals": signals})
+        raw_faces.append({"face_center": face_center, "signals": signals})
 
+    per_face_data = _deduplicate_faces(raw_faces, frame_w)
     return per_face_data, pose_results, face_results
+
+
+_DEDUP_FRACTION = 0.12
+
+
+def _deduplicate_faces(faces: list[dict], frame_w: int) -> list[dict]:
+    """Merge detections that are too close (same person detected twice)."""
+    if len(faces) <= 1:
+        return faces
+    threshold = frame_w * _DEDUP_FRACTION
+    keep: list[dict] = []
+    used: set[int] = set()
+    for i, face in enumerate(faces):
+        if i in used:
+            continue
+        for j in range(i + 1, len(faces)):
+            if j in used:
+                continue
+            dist = math.hypot(
+                face["face_center"][0] - faces[j]["face_center"][0],
+                face["face_center"][1] - faces[j]["face_center"][1],
+            )
+            if dist < threshold:
+                used.add(j)
+        keep.append(face)
+    return keep
 
 
 # ---------------------------------------------------------------------------
@@ -364,30 +391,42 @@ def process_frame_multi(frame_bgr, pose, face_mesh):
 # ---------------------------------------------------------------------------
 
 class _PersonTrack:
-    __slots__ = ("person_id", "face_center", "accumulator", "last_seen")
+    __slots__ = ("person_id", "face_center", "accumulator", "last_seen", "seen_count")
 
     def __init__(self, person_id: int, face_center: tuple[float, float], frame_index: int):
         self.person_id = person_id
         self.face_center = face_center
         self.accumulator = SignalAccumulator()
         self.last_seen = frame_index
+        self.seen_count = 1
 
 
 class MultiPersonTracker:
     """Track multiple people across frames using face-position matching."""
 
-    MAX_MATCH_DISTANCE = 150.0
+    MAX_MATCH_FRACTION = 0.35
     STALE_FRAME_LIMIT = 45
+    MIN_CONFIRM_FRAMES = 4
+    EMA_ALPHA = 0.45
 
     def __init__(self) -> None:
         self._tracks: dict[int, _PersonTrack] = {}
         self._next_id = 1
+        self._frame_w = 640
 
     def update(self, per_face_data: list[dict], frame_index: int) -> list[dict]:
         """Match detected faces to tracks and update accumulators.
 
-        Returns list of {"person_id", "face_center", "signals"} sorted by id.
+        Returns list of confirmed tracks (seen >= MIN_CONFIRM_FRAMES):
+        {"person_id", "face_center", "signals", "seen_count"} sorted by id.
         """
+        if per_face_data:
+            cx = per_face_data[0]["face_center"][0]
+            if cx > 0:
+                self._frame_w = max(self._frame_w, cx * 2.5)
+
+        max_dist = self._frame_w * self.MAX_MATCH_FRACTION
+
         used_tracks: set[int] = set()
         used_faces: set[int] = set()
 
@@ -404,11 +443,16 @@ class MultiPersonTracker:
         for dist, fi, tid in pairs:
             if fi in used_faces or tid in used_tracks:
                 continue
-            if dist > self.MAX_MATCH_DISTANCE:
+            if dist > max_dist:
                 continue
             track = self._tracks[tid]
-            track.face_center = per_face_data[fi]["face_center"]
+            a = self.EMA_ALPHA
+            track.face_center = (
+                a * per_face_data[fi]["face_center"][0] + (1 - a) * track.face_center[0],
+                a * per_face_data[fi]["face_center"][1] + (1 - a) * track.face_center[1],
+            )
             track.last_seen = frame_index
+            track.seen_count += 1
             track.accumulator.add_frame(per_face_data[fi]["signals"])
             used_faces.add(fi)
             used_tracks.add(tid)
@@ -436,15 +480,18 @@ class MultiPersonTracker:
                 "person_id": tid,
                 "face_center": track.face_center,
                 "signals": track.accumulator.current_signals(),
+                "seen_count": track.seen_count,
             }
             for tid, track in sorted(self._tracks.items())
+            if track.seen_count >= self.MIN_CONFIRM_FRAMES
         ]
 
     def get_all_final(self) -> list[dict]:
-        """Get final signals for all tracked people."""
+        """Get final signals for all confirmed tracked people."""
         return [
             {"person_id": tid, "signals": t.accumulator.final_signals()}
             for tid, t in sorted(self._tracks.items())
+            if t.seen_count >= self.MIN_CONFIRM_FRAMES
         ]
 
     def get_person_final_and_reset(self, person_id: int) -> dict | None:
@@ -458,7 +505,10 @@ class MultiPersonTracker:
 
     @property
     def track_count(self) -> int:
-        return len(self._tracks)
+        return sum(
+            1 for t in self._tracks.values()
+            if t.seen_count >= self.MIN_CONFIRM_FRAMES
+        )
 
 
 def extract_signals(video_path: str) -> Dict[str, float]:

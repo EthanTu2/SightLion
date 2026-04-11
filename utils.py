@@ -46,6 +46,24 @@ def resize_thumbnail(image, size: tuple[int, int] = (80, 80)):
     return cv2.resize(image, size, interpolation=cv2.INTER_AREA)
 
 
+def crop_face_thumbnail(
+    frame_rgb, center_x: float, center_y: float, size: int = 120
+):
+    """Crop a generous square face region from an RGB frame."""
+    h, w = frame_rgb.shape[:2]
+    cx, cy = int(center_x), int(center_y)
+    radius = max(int(h * 0.22), 90)
+    cy_shifted = cy - int(radius * 0.15)
+    x0 = max(0, cx - radius)
+    y0 = max(0, cy_shifted - radius)
+    x1 = min(w, cx + radius)
+    y1 = min(h, cy_shifted + radius)
+    crop = frame_rgb[y0:y1, x0:x1]
+    if crop.size == 0:
+        return create_placeholder_thumbnail("?", "#94A3B8")
+    return cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA)
+
+
 def image_to_base64(image) -> str:
     """Encode a NumPy image into base64 for HTML rendering."""
     if image is None:

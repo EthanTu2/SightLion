@@ -30,6 +30,7 @@ from signals import (
 from utils import (
     annotate_frame,
     create_demo_frame,
+    crop_face_thumbnail,
     image_to_base64,
     resize_thumbnail,
 )
@@ -248,6 +249,14 @@ def _inject_styles() -> None:
             .tv-card-inner { display: flex; align-items: stretch; }
             .tv-card-bar { width: 5px; flex-shrink: 0; border-radius: 10px 0 0 10px; }
             .tv-card-body { padding: 16px 18px; width: 100%; }
+            .tv-card-head { display: flex; align-items: center; gap: 14px; }
+            .tv-card-face {
+                width: 64px; height: 64px;
+                border-radius: 50%;
+                object-fit: cover;
+                flex-shrink: 0;
+            }
+            .tv-card-info { flex: 1; min-width: 0; }
             .tv-card-row1 {
                 display: flex; justify-content: space-between; align-items: center;
             }
@@ -446,6 +455,7 @@ def _update_assess_tiles(slot, person_states: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def _render_patient_card(patient: dict) -> None:
+    b64 = image_to_base64(patient.get("thumbnail"))
     pid = html.escape(str(patient.get("patient_id", "Unknown")))
     label = html.escape(str(patient.get("label", "Stable")))
     ts = html.escape(str(patient.get("timestamp", "")))
@@ -487,6 +497,10 @@ def _render_patient_card(patient: dict) -> None:
         f'<div class="tv-card-inner">'
         f'<div class="tv-card-bar" style="background:{hex_color};"></div>'
         f'<div class="tv-card-body">'
+        f'<div class="tv-card-head">'
+        f'<img class="tv-card-face" src="data:image/png;base64,{b64}" '
+        f'style="border:2.5px solid {hex_color};" />'
+        f'<div class="tv-card-info">'
         f'<div class="tv-card-row1">'
         f'<div class="tv-card-pid">{pid}</div>'
         f'<div class="tv-card-pill" style="background:{hex_color}18;color:{hex_color};">{label}</div>'
@@ -494,6 +508,8 @@ def _render_patient_card(patient: dict) -> None:
         f'<div class="tv-card-row2">'
         f'<div class="tv-card-score" style="color:{hex_color};">{score}</div>'
         f'<div class="tv-card-score-sub">/ 100 &nbsp; Triage Severity</div>'
+        f'</div>'
+        f'</div>'
         f'</div>'
         f'<div class="tv-card-track">'
         f'<div class="tv-card-fill" style="width:{score}%;background:{hex_color};"></div>'
@@ -525,9 +541,13 @@ def _stream_capture_loop(
     playback_speed: float = 1.0,
     countdown_prefix: str | None = None,
 ):
-    """Multi-person capture loop. Returns (all_final, latest_rgb_frame)."""
+    """Multi-person capture loop. Returns (all_final, latest_rgb_frame).
+
+    Each entry in all_final includes a 'face_crop' key (80x80 RGB array or None).
+    """
     tracker = MultiPersonTracker()
     person_states: list[dict] = []
+    face_crops: dict[int, object] = {}
     latest_rgb_frame = None
     start_time = time.monotonic()
     frame_index = 0
@@ -559,6 +579,14 @@ def _stream_capture_loop(
                 person_states = _enrich_person_states(raw_tracks)
                 if per_face_data:
                     latest_rgb_frame = _frame_to_rgb(frame)
+                    for ps in person_states:
+                        pid = ps["person_id"]
+                        if ps.get("seen_count", 0) >= 6 or pid not in face_crops:
+                            face_crops[pid] = crop_face_thumbnail(
+                                latest_rgb_frame,
+                                ps["face_center"][0],
+                                ps["face_center"][1],
+                            )
 
             countdown_text = None
             if duration_seconds is not None and countdown_prefix is not None:
@@ -578,7 +606,10 @@ def _stream_capture_loop(
             if sleep_seconds > 0:
                 time.sleep(sleep_seconds)
 
-    return tracker.get_all_final(), latest_rgb_frame
+    all_final = tracker.get_all_final()
+    for pdata in all_final:
+        pdata["face_crop"] = face_crops.get(pdata["person_id"])
+    return all_final, latest_rgb_frame
 
 
 def _capture_live_patients(
@@ -599,13 +630,16 @@ def _capture_live_patients(
     finally:
         webcam.release()
 
-    thumbnail = resize_thumbnail(latest_rgb_frame) if latest_rgb_frame is not None else None
+    fallback_thumb = resize_thumbnail(latest_rgb_frame) if latest_rgb_frame is not None else None
     records: list[dict] = []
-    for i, pdata in enumerate(all_final):
+    for pdata in all_final:
         override = patient_override if len(all_final) == 1 else ""
         pid = _consume_patient_id(override)
+        thumb = pdata.get("face_crop")
+        if thumb is None:
+            thumb = fallback_thumb
         records.append(
-            build_patient_record(patient_id=pid, signals=pdata["signals"], thumbnail=thumbnail)
+            build_patient_record(patient_id=pid, signals=pdata["signals"], thumbnail=thumb)
         )
     return records
 
@@ -637,6 +671,7 @@ def _run_continuous_monitoring(frame_slot, signal_slot):
 
     tracker = MultiPersonTracker()
     person_states: list[dict] = []
+    face_crops: dict[int, object] = {}
     latest_rgb_frame = None
     frame_index = 0
     start_time = time.monotonic()
@@ -661,6 +696,14 @@ def _run_continuous_monitoring(frame_slot, signal_slot):
                     person_states = _enrich_person_states(raw_tracks)
                     if per_face_data:
                         latest_rgb_frame = _frame_to_rgb(frame)
+                        for ps in person_states:
+                            pid = ps["person_id"]
+                            if ps.get("seen_count", 0) >= 6 or pid not in face_crops:
+                                face_crops[pid] = crop_face_thumbnail(
+                                    latest_rgb_frame,
+                                    ps["face_center"][0],
+                                    ps["face_center"][1],
+                                )
 
                 any_critical = False
                 for ps in person_states:
@@ -673,11 +716,9 @@ def _run_continuous_monitoring(frame_slot, signal_slot):
                         if crit_dur >= CRITICAL_ALERT_SECONDS:
                             person_signals = tracker.get_person_final_and_reset(pid)
                             if person_signals:
-                                thumb = (
-                                    resize_thumbnail(latest_rgb_frame)
-                                    if latest_rgb_frame is not None
-                                    else None
-                                )
+                                thumb = face_crops.get(pid)
+                                if thumb is None and latest_rgb_frame is not None:
+                                    thumb = resize_thumbnail(latest_rgb_frame)
                                 pnum = int(st.session_state["next_patient_number"])
                                 st.session_state["next_patient_number"] = pnum + 1
                                 patient_id = f"Patient {pnum:03d}"
@@ -726,6 +767,7 @@ def _run_continuous_monitoring(frame_slot, signal_slot):
 
                 st.session_state["monitoring_data"] = {
                     "all_final": tracker.get_all_final(),
+                    "face_crops": dict(face_crops),
                     "thumbnail": latest_rgb_frame,
                 }
     finally:
@@ -955,14 +997,16 @@ def main() -> None:
                     st.session_state["monitoring_active"] = False
                     data = st.session_state.get("monitoring_data")
                     if data and data.get("all_final"):
+                        saved_crops = data.get("face_crops", {})
+                        fallback = (
+                            resize_thumbnail(data["thumbnail"])
+                            if data.get("thumbnail") is not None
+                            else None
+                        )
                         for pdata in data["all_final"]:
                             override = patient_override if len(data["all_final"]) == 1 else ""
                             pid = _consume_patient_id(override)
-                            thumb = (
-                                resize_thumbnail(data["thumbnail"])
-                                if data.get("thumbnail") is not None
-                                else None
-                            )
+                            thumb = saved_crops.get(pdata["person_id"], fallback)
                             record = build_patient_record(
                                 patient_id=pid, signals=pdata["signals"], thumbnail=thumb
                             )
@@ -1017,7 +1061,7 @@ def main() -> None:
                             all_final, latest_rgb_frame = _play_uploaded_video(
                                 frame_slot, signal_slot, tmp, playback_speed
                             )
-                            thumb = (
+                            fallback_thumb = (
                                 resize_thumbnail(latest_rgb_frame)
                                 if latest_rgb_frame is not None
                                 else None
@@ -1029,6 +1073,7 @@ def main() -> None:
                                     else ""
                                 )
                                 pid = _consume_patient_id(override)
+                                thumb = pdata.get("face_crop", fallback_thumb)
                                 rec = build_patient_record(
                                     patient_id=pid,
                                     signals=pdata["signals"],
