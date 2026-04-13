@@ -26,8 +26,10 @@ MIN_VALID_FRAMES = 5
 
 POSTURE_UPRIGHT_RATIO = 0.50
 POSTURE_RANGE = 0.35
-BODY_SWAY_MAX_STD_PX = 130.0
-ARM_DRIFT_SCALE = 0.50
+BODY_SWAY_NORM_SCALE = 0.14
+SWAY_DEAD_ZONE = 0.018
+EMA_ALPHA = 0.35
+ARM_DRIFT_SCALE = 0.80
 THROAT_Y_RANGE_RATIO = 0.15
 THROAT_X_RANGE_RATIO = 0.25
 THROAT_FRAME_FRACTION_THRESHOLD = 0.30
@@ -95,12 +97,17 @@ def create_face_mesh_estimator(max_num_faces: int = 5):
 class SignalAccumulator:
     """Accumulate frame-level signals into running averages."""
 
+    _window = 90
+
     def __init__(self) -> None:
         self.reset()
 
     def reset(self) -> None:
+        from collections import deque
         self.valid_frames = 0
-        self.nose_positions_x: list[float] = []
+        self.nose_positions_x: deque[float] = deque(maxlen=self._window)
+        self.shoulder_widths: deque[float] = deque(maxlen=self._window)
+        self._ema: dict[str, float] = {}
         self.samples = {
             "slumped_posture": [],
             "tripod_position": [],
@@ -113,6 +120,9 @@ class SignalAccumulator:
     def add_frame(self, frame_signals: dict) -> None:
         self.valid_frames += 1
         self.nose_positions_x.append(float(frame_signals["nose_x"]))
+        sw = float(frame_signals.get("shoulder_width", 0.0))
+        if sw > 0:
+            self.shoulder_widths.append(sw)
         for key in self.samples:
             self.samples[key].append(float(frame_signals[key]))
 
@@ -132,8 +142,21 @@ class SignalAccumulator:
             throat_fraction if throat_fraction >= THROAT_FRAME_FRACTION_THRESHOLD else 0.0
         )
 
-        if len(self.nose_positions_x) > 1:
-            signals["body_sway"] = _clamp01(float(np.std(self.nose_positions_x)) / BODY_SWAY_MAX_STD_PX)
+        if len(self.nose_positions_x) > 2:
+            nose_std = float(np.std(list(self.nose_positions_x)))
+            ref = _safe_mean(list(self.shoulder_widths)) if self.shoulder_widths else 0.0
+            if ref > 1.0:
+                norm_sway = nose_std / ref
+            else:
+                norm_sway = 0.0
+            if norm_sway < SWAY_DEAD_ZONE:
+                norm_sway = 0.0
+            raw_sway = _clamp01(norm_sway / BODY_SWAY_NORM_SCALE)
+            prev_sway = self._ema.get("body_sway")
+            if prev_sway is not None:
+                raw_sway = EMA_ALPHA * raw_sway + (1.0 - EMA_ALPHA) * prev_sway
+            self._ema["body_sway"] = raw_sway
+            signals["body_sway"] = raw_sway
         return signals
 
     def final_signals(self) -> Dict[str, float]:
@@ -270,6 +293,7 @@ def analyze_landmarks(pose_landmarks, face_landmarks, frame_shape) -> Dict[str, 
         "facial_asymmetry": _facial_asymmetry(face_landmarks, frame_w),
         "low_alertness": _low_alertness(face_landmarks),
         "nose_x": nose_pose[0],
+        "shoulder_width": shoulder_width,
     }
 
 
@@ -309,6 +333,69 @@ def _face_nose_px(face_landmarks, frame_w: int, frame_h: int) -> tuple[float, fl
     return face_landmarks[1].x * frame_w, face_landmarks[1].y * frame_h
 
 
+# ---------------------------------------------------------------------------
+# Geometric face embedding  (Face ID–inspired)
+# Ratios between landmark pairs are scale-/lighting-/expression-invariant.
+# ---------------------------------------------------------------------------
+
+_GEO_PAIRS = [
+    (33, 263),   # outer eye to outer eye
+    (133, 362),  # inner eye to inner eye
+    (33, 133),   # left eye width
+    (263, 362),  # right eye width
+    (10, 152),   # forehead to chin (face height)
+    (1, 10),     # nose tip to forehead
+    (1, 152),    # nose tip to chin
+    (61, 291),   # mouth width
+    (129, 358),  # nostril width
+    (107, 133),  # left brow inner to left eye inner
+    (336, 362),  # right brow inner to right eye inner
+    (1, 13),     # nose tip to upper lip
+    (13, 14),    # lip opening height
+    (70, 300),   # outer brow spread
+    (33, 1),     # left outer eye to nose
+    (263, 1),    # right outer eye to nose
+    (61, 152),   # mouth left to chin
+    (291, 152),  # mouth right to chin
+]
+
+
+def _lm_dist(lms, a: int, b: int) -> float:
+    return math.hypot(lms[a].x - lms[b].x, lms[a].y - lms[b].y)
+
+
+def compute_geometric_embedding(face_landmarks) -> np.ndarray | None:
+    """Compact face-identity vector from landmark distance ratios.
+
+    All distances are normalised by cheek-to-cheek width so the vector is
+    scale-invariant.  Three vertical-position ratios are appended for extra
+    discriminative power.  ~21 dimensions, very fast.
+    """
+    lms = face_landmarks
+    fw = _lm_dist(lms, 234, 454)
+    if fw < 1e-6:
+        return None
+
+    features = [_lm_dist(lms, a, b) / fw for a, b in _GEO_PAIRS]
+
+    face_h = lms[152].y - lms[10].y
+    if abs(face_h) > 1e-6:
+        features.append((lms[1].y - lms[10].y) / face_h)
+        features.append((lms[13].y - lms[10].y) / face_h)
+        features.append(((lms[133].y + lms[362].y) / 2 - lms[10].y) / face_h)
+    else:
+        features.extend([0.5, 0.7, 0.35])
+
+    return np.array(features, dtype=np.float32)
+
+
+def _face_bbox_px(face_landmarks, frame_w: int, frame_h: int) -> tuple[float, float, float, float]:
+    """Tight bounding box from all face mesh landmarks (x0, y0, x1, y1)."""
+    xs = [lm.x * frame_w for lm in face_landmarks]
+    ys = [lm.y * frame_h for lm in face_landmarks]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
 def process_frame_multi(frame_bgr, pose, face_mesh):
     """Run MediaPipe for multi-person detection.
 
@@ -346,6 +433,8 @@ def process_frame_multi(frame_bgr, pose, face_mesh):
     raw_faces: list[dict] = []
     for fi, face_lms in enumerate(face_results.multi_face_landmarks):
         face_center = _face_nose_px(face_lms.landmark, frame_w, frame_h)
+        face_bbox = _face_bbox_px(face_lms.landmark, frame_w, frame_h)
+        geo_emb = compute_geometric_embedding(face_lms.landmark)
         if fi == best_pose_face_idx:
             signals = analyze_landmarks(
                 pose_results.pose_landmarks.landmark,
@@ -354,7 +443,12 @@ def process_frame_multi(frame_bgr, pose, face_mesh):
             )
         else:
             signals = analyze_face_only(face_lms.landmark, frame_bgr.shape)
-        raw_faces.append({"face_center": face_center, "signals": signals})
+        raw_faces.append({
+            "face_center": face_center,
+            "face_bbox": face_bbox,
+            "face_embedding": geo_emb,
+            "signals": signals,
+        })
 
     per_face_data = _deduplicate_faces(raw_faces, frame_w)
     return per_face_data, pose_results, face_results
@@ -390,15 +484,30 @@ def _deduplicate_faces(faces: list[dict], frame_w: int) -> list[dict]:
 # Multi-person tracker
 # ---------------------------------------------------------------------------
 
+def _is_still(centers: list, threshold: float = 8.0) -> bool:
+    if len(centers) < 5:
+        return False
+    recent = centers[-5:]
+    xs = [c[0] for c in recent]
+    ys = [c[1] for c in recent]
+    return float(np.std(xs)) < threshold and float(np.std(ys)) < threshold
+
+
 class _PersonTrack:
-    __slots__ = ("person_id", "face_center", "accumulator", "last_seen", "seen_count")
+    __slots__ = (
+        "person_id", "face_center", "face_bbox", "face_embedding",
+        "accumulator", "last_seen", "seen_count", "recent_centers",
+    )
 
     def __init__(self, person_id: int, face_center: tuple[float, float], frame_index: int):
         self.person_id = person_id
         self.face_center = face_center
+        self.face_bbox: tuple[float, float, float, float] | None = None
+        self.face_embedding = None
         self.accumulator = SignalAccumulator()
         self.last_seen = frame_index
         self.seen_count = 1
+        self.recent_centers: list[tuple[float, float]] = [face_center]
 
 
 class MultiPersonTracker:
@@ -446,11 +555,19 @@ class MultiPersonTracker:
             if dist > max_dist:
                 continue
             track = self._tracks[tid]
+            raw_center = per_face_data[fi]["face_center"]
             a = self.EMA_ALPHA
             track.face_center = (
-                a * per_face_data[fi]["face_center"][0] + (1 - a) * track.face_center[0],
-                a * per_face_data[fi]["face_center"][1] + (1 - a) * track.face_center[1],
+                a * raw_center[0] + (1 - a) * track.face_center[0],
+                a * raw_center[1] + (1 - a) * track.face_center[1],
             )
+            track.face_bbox = per_face_data[fi].get("face_bbox")
+            emb = per_face_data[fi].get("face_embedding")
+            if emb is not None:
+                track.face_embedding = emb
+            track.recent_centers.append(raw_center)
+            if len(track.recent_centers) > 10:
+                track.recent_centers = track.recent_centers[-10:]
             track.last_seen = frame_index
             track.seen_count += 1
             track.accumulator.add_frame(per_face_data[fi]["signals"])
@@ -464,6 +581,8 @@ class MultiPersonTracker:
             self._next_id += 1
             face = per_face_data[fi]
             track = _PersonTrack(pid, face["face_center"], frame_index)
+            track.face_bbox = face.get("face_bbox")
+            track.face_embedding = face.get("face_embedding")
             track.accumulator.add_frame(face["signals"])
             self._tracks[pid] = track
 
@@ -479,8 +598,11 @@ class MultiPersonTracker:
             {
                 "person_id": tid,
                 "face_center": track.face_center,
+                "face_bbox": track.face_bbox,
+                "face_embedding": track.face_embedding,
                 "signals": track.accumulator.current_signals(),
                 "seen_count": track.seen_count,
+                "is_still": _is_still(track.recent_centers),
             }
             for tid, track in sorted(self._tracks.items())
             if track.seen_count >= self.MIN_CONFIRM_FRAMES
@@ -489,7 +611,13 @@ class MultiPersonTracker:
     def get_all_final(self) -> list[dict]:
         """Get final signals for all confirmed tracked people."""
         return [
-            {"person_id": tid, "signals": t.accumulator.final_signals()}
+            {
+                "person_id": tid,
+                "face_center": t.face_center,
+                "face_bbox": t.face_bbox,
+                "face_embedding": t.face_embedding,
+                "signals": t.accumulator.final_signals(),
+            }
             for tid, t in sorted(self._tracks.items())
             if t.seen_count >= self.MIN_CONFIRM_FRAMES
         ]

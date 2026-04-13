@@ -47,21 +47,87 @@ def resize_thumbnail(image, size: tuple[int, int] = (80, 80)):
 
 
 def crop_face_thumbnail(
-    frame_rgb, center_x: float, center_y: float, size: int = 120
+    frame_rgb,
+    face_bbox: tuple[float, float, float, float] | None = None,
+    center_x: float | None = None,
+    center_y: float | None = None,
+    size: int = 120,
 ):
-    """Crop a generous square face region from an RGB frame."""
+    """Crop a square face region.  Prefers *face_bbox* (landmark-derived)
+    which scales naturally with distance; falls back to centre + fixed radius."""
     h, w = frame_rgb.shape[:2]
-    cx, cy = int(center_x), int(center_y)
-    radius = max(int(h * 0.22), 90)
-    cy_shifted = cy - int(radius * 0.15)
-    x0 = max(0, cx - radius)
-    y0 = max(0, cy_shifted - radius)
-    x1 = min(w, cx + radius)
-    y1 = min(h, cy_shifted + radius)
-    crop = frame_rgb[y0:y1, x0:x1]
+
+    if face_bbox is not None:
+        bx0, by0, bx1, by1 = face_bbox
+        fw, fh = bx1 - bx0, by1 - by0
+        pad = max(fw, fh) * 0.55
+        x0 = max(0, int(bx0 - pad * 0.6))
+        y0 = max(0, int(by0 - pad * 0.85))
+        x1 = min(w, int(bx1 + pad * 0.6))
+        y1 = min(h, int(by1 + pad * 0.4))
+    else:
+        cx = int(center_x or w // 2)
+        cy = int(center_y or h // 2)
+        radius = max(int(h * 0.22), 90)
+        cy -= int(radius * 0.15)
+        x0, y0 = max(0, cx - radius), max(0, cy - radius)
+        x1, y1 = min(w, cx + radius), min(h, cy + radius)
+
+    cw, ch = x1 - x0, y1 - y0
+    side = max(cw, ch)
+    mid_x, mid_y = (x0 + x1) // 2, (y0 + y1) // 2
+    sx0 = max(0, mid_x - side // 2)
+    sy0 = max(0, mid_y - side // 2)
+    sx1 = min(w, sx0 + side)
+    sy1 = min(h, sy0 + side)
+
+    crop = frame_rgb[sy0:sy1, sx0:sx1]
     if crop.size == 0:
         return create_placeholder_thumbnail("?", "#94A3B8")
     return cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA)
+
+
+# ---------------------------------------------------------------------------
+# Face re-identification  (Apple Face ID–inspired multi-template approach)
+# ---------------------------------------------------------------------------
+
+_MAX_TEMPLATES = 5
+_TEMPLATE_DIVERSITY = 0.95
+
+
+_GEO_MAX_DIST = 0.50
+
+
+def face_similarity(emb1, emb2) -> float:
+    """Similarity between two geometric face embeddings (0–1).
+
+    Uses Euclidean distance on raw landmark-ratio vectors, converted to
+    a 0–1 score.  Distance 0 → 1.0, distance ≥ _GEO_MAX_DIST → 0.0.
+    """
+    if emb1 is None or emb2 is None:
+        return 0.0
+    dist = float(np.linalg.norm(emb1 - emb2))
+    return max(0.0, 1.0 - dist / _GEO_MAX_DIST)
+
+
+def best_template_similarity(
+    query: np.ndarray | None, templates: list
+) -> float:
+    """Max cosine similarity between *query* and any template in list."""
+    if query is None or not templates:
+        return 0.0
+    return max(face_similarity(query, t) for t in templates)
+
+
+def add_template(templates: list, emb, max_n: int = _MAX_TEMPLATES) -> None:
+    """Append *emb* to *templates* if sufficiently diverse and under cap."""
+    if emb is None:
+        return
+    for existing in templates:
+        if face_similarity(emb, existing) > _TEMPLATE_DIVERSITY:
+            return
+    if len(templates) < max_n:
+        templates.append(emb)
 
 
 def image_to_base64(image) -> str:
@@ -101,7 +167,6 @@ def draw_person_labels(frame_bgr, person_states: list[dict]) -> None:
     """Draw patient labels above each tracked person's face."""
     for person in person_states:
         cx = int(person["face_center"][0])
-        cy = int(person["face_center"][1])
         label = person["label"]
         bgr = _hex_to_bgr(person["hex"])
 
@@ -110,7 +175,11 @@ def draw_person_labels(frame_bgr, person_states: list[dict]) -> None:
         thickness = 2
         text_size, _ = cv2.getTextSize(label, font, scale, thickness)
 
-        label_y = cy - 75
+        bbox = person.get("face_bbox")
+        if bbox is not None:
+            label_y = max(10, int(bbox[1]) - 12)
+        else:
+            label_y = int(person["face_center"][1]) - 75
         label_x = cx - text_size[0] // 2
         pad = 8
 

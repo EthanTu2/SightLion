@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import html
 import math
 import os
+import pathlib
 import tempfile
 import time
 
@@ -28,9 +30,12 @@ from signals import (
     zero_signals,
 )
 from utils import (
+    add_template,
     annotate_frame,
+    best_template_similarity,
     create_demo_frame,
     crop_face_thumbnail,
+    face_similarity,
     image_to_base64,
     resize_thumbnail,
 )
@@ -62,6 +67,98 @@ def _level_css_color(level: str) -> str:
     if level in ("MODERATE", "Drowsy"):
         return "#D97706"
     return "#16A34A"
+
+
+_FACE_MATCH_THRESHOLD = 0.65
+
+
+def _find_matching_patient(
+    templates: list, patients: list[dict]
+) -> int | None:
+    """Return queue index of the patient whose face best matches *templates*.
+
+    Apple Face ID–style: compare every query template against every stored
+    template and take the maximum.
+    """
+    if not templates:
+        return None
+    best_sim, best_idx = 0.0, None
+    for i, p in enumerate(patients):
+        p_templates = p.get("face_embeddings", [])
+        for q_emb in templates:
+            sim = best_template_similarity(q_emb, p_templates)
+            if sim > best_sim:
+                best_sim, best_idx = sim, i
+    return best_idx if best_sim >= _FACE_MATCH_THRESHOLD else None
+
+
+def _save_or_merge_patient(record: dict) -> tuple[str, bool]:
+    """Append *record* to queue, or merge into an existing match.
+
+    On merge the stored template set grows (adaptive learning, like Face ID
+    updating its model after each successful unlock).
+    Returns (patient_id, was_merged).
+    """
+    patients = st.session_state["patients"]
+    new_templates = record.get("face_embeddings", [])
+    match_idx = _find_matching_patient(new_templates, patients)
+    if match_idx is not None:
+        existing = patients[match_idx]
+        for key in (
+            "score", "label", "hex", "color", "assessments", "explanation",
+            "signals", "thumbnail", "timestamp", "warning",
+        ):
+            if key in record:
+                existing[key] = record[key]
+        old_t = existing.setdefault("face_embeddings", [])
+        for emb in new_templates:
+            add_template(old_t, emb)
+        return existing["patient_id"], True
+    patients.append(record)
+    return record["patient_id"], False
+
+
+def _relabel_from_queue(
+    person_states: list[dict], face_emb_map: dict[int, list]
+) -> None:
+    """Override live track labels with queue patient IDs when faces match.
+
+    Uses greedy 1-to-1 assignment so two tracks never claim the same patient.
+    Compares each track's template *set* against each patient's template set.
+    """
+    patients = st.session_state.get("patients", [])
+    if not patients:
+        return
+
+    pairs: list[tuple[float, int, int]] = []
+    for ps in person_states:
+        track_templates = face_emb_map.get(ps["person_id"], [])
+        if not track_templates:
+            continue
+        for qi, p in enumerate(patients):
+            p_templates = p.get("face_embeddings", [])
+            if not p_templates:
+                continue
+            sim = max(
+                best_template_similarity(t, p_templates)
+                for t in track_templates
+            )
+            if sim >= _FACE_MATCH_THRESHOLD:
+                pairs.append((sim, ps["person_id"], qi))
+
+    pairs.sort(reverse=True)
+    used_tracks: set[int] = set()
+    used_patients: set[int] = set()
+    for sim, track_pid, qi in pairs:
+        if track_pid in used_tracks or qi in used_patients:
+            continue
+        for ps in person_states:
+            if ps["person_id"] == track_pid:
+                ps["queue_patient_id"] = patients[qi]["patient_id"]
+                ps["label"] = patients[qi]["patient_id"]
+                break
+        used_tracks.add(track_pid)
+        used_patients.add(qi)
 
 
 def _enrich_person_states(raw_tracks: list[dict]) -> list[dict]:
@@ -113,14 +210,12 @@ def _inject_styles() -> None:
                 display: flex; align-items: center; gap: 16px;
                 box-shadow: 0 2px 8px rgba(15,23,42,0.12);
             }
-            .tv-cross {
-                width: 34px; height: 34px; border-radius: 8px;
-                background: var(--red);
-                display: inline-flex; align-items: center; justify-content: center;
-                font-size: 20px; font-weight: 700; color: #fff; line-height: 1;
+            .tv-logo {
+                height: 40px; object-fit: contain; flex-shrink: 0;
             }
-            .tv-header-title { font-size: 23px; font-weight: 800; letter-spacing: -0.5px; }
-            .tv-header-sub   { font-size: 12.5px; color: var(--slate-400); margin-top: 4px; }
+            .tv-header-sub {
+                font-size: 12.5px; color: var(--slate-400); margin-top: 2px;
+            }
 
             /* ── Disclaimer ─────────────────────────────── */
             .tv-disclaimer {
@@ -548,6 +643,7 @@ def _stream_capture_loop(
     tracker = MultiPersonTracker()
     person_states: list[dict] = []
     face_crops: dict[int, object] = {}
+    face_emb_map: dict[int, list] = {}
     latest_rgb_frame = None
     start_time = time.monotonic()
     frame_index = 0
@@ -581,12 +677,18 @@ def _stream_capture_loop(
                     latest_rgb_frame = _frame_to_rgb(frame)
                     for ps in person_states:
                         pid = ps["person_id"]
-                        if ps.get("seen_count", 0) >= 6 or pid not in face_crops:
+                        is_still = ps.get("is_still", False)
+                        seen = ps.get("seen_count", 0)
+                        geo_emb = ps.get("face_embedding")
+                        add_template(face_emb_map.setdefault(pid, []), geo_emb)
+                        if (is_still and seen >= 6) or (pid not in face_crops and seen >= 10):
                             face_crops[pid] = crop_face_thumbnail(
                                 latest_rgb_frame,
-                                ps["face_center"][0],
-                                ps["face_center"][1],
+                                face_bbox=ps.get("face_bbox"),
+                                center_x=ps["face_center"][0],
+                                center_y=ps["face_center"][1],
                             )
+                    _relabel_from_queue(person_states, face_emb_map)
 
             countdown_text = None
             if duration_seconds is not None and countdown_prefix is not None:
@@ -608,7 +710,9 @@ def _stream_capture_loop(
 
     all_final = tracker.get_all_final()
     for pdata in all_final:
-        pdata["face_crop"] = face_crops.get(pdata["person_id"])
+        pid = pdata["person_id"]
+        pdata["face_crop"] = face_crops.get(pid)
+        pdata["face_embeddings"] = face_emb_map.get(pid, [])
     return all_final, latest_rgb_frame
 
 
@@ -634,13 +738,19 @@ def _capture_live_patients(
     records: list[dict] = []
     for pdata in all_final:
         override = patient_override if len(all_final) == 1 else ""
-        pid = _consume_patient_id(override)
+        templates = pdata.get("face_embeddings", [])
+        match_idx = _find_matching_patient(templates, st.session_state["patients"])
+        if match_idx is not None:
+            pid = st.session_state["patients"][match_idx]["patient_id"]
+        else:
+            pid = _consume_patient_id(override)
         thumb = pdata.get("face_crop")
         if thumb is None:
             thumb = fallback_thumb
-        records.append(
-            build_patient_record(patient_id=pid, signals=pdata["signals"], thumbnail=thumb)
-        )
+        record = build_patient_record(patient_id=pid, signals=pdata["signals"], thumbnail=thumb)
+        record["face_embeddings"] = templates
+        _save_or_merge_patient(record)
+        records.append(record)
     return records
 
 
@@ -672,6 +782,7 @@ def _run_continuous_monitoring(frame_slot, signal_slot):
     tracker = MultiPersonTracker()
     person_states: list[dict] = []
     face_crops: dict[int, object] = {}
+    face_emb_map: dict[int, list] = {}
     latest_rgb_frame = None
     frame_index = 0
     start_time = time.monotonic()
@@ -698,12 +809,18 @@ def _run_continuous_monitoring(frame_slot, signal_slot):
                         latest_rgb_frame = _frame_to_rgb(frame)
                         for ps in person_states:
                             pid = ps["person_id"]
-                            if ps.get("seen_count", 0) >= 6 or pid not in face_crops:
+                            is_still = ps.get("is_still", False)
+                            seen = ps.get("seen_count", 0)
+                            geo_emb = ps.get("face_embedding")
+                            add_template(face_emb_map.setdefault(pid, []), geo_emb)
+                            if (is_still and seen >= 6) or (pid not in face_crops and seen >= 10):
                                 face_crops[pid] = crop_face_thumbnail(
                                     latest_rgb_frame,
-                                    ps["face_center"][0],
-                                    ps["face_center"][1],
+                                    face_bbox=ps.get("face_bbox"),
+                                    center_x=ps["face_center"][0],
+                                    center_y=ps["face_center"][1],
                                 )
+                        _relabel_from_queue(person_states, face_emb_map)
 
                 any_critical = False
                 for ps in person_states:
@@ -719,18 +836,27 @@ def _run_continuous_monitoring(frame_slot, signal_slot):
                                 thumb = face_crops.get(pid)
                                 if thumb is None and latest_rgb_frame is not None:
                                     thumb = resize_thumbnail(latest_rgb_frame)
-                                pnum = int(st.session_state["next_patient_number"])
-                                st.session_state["next_patient_number"] = pnum + 1
-                                patient_id = f"Patient {pnum:03d}"
+                                templates = face_emb_map.get(pid, [])
+                                match_idx = _find_matching_patient(
+                                    templates, st.session_state["patients"]
+                                )
+                                if match_idx is not None:
+                                    patient_id = st.session_state["patients"][match_idx]["patient_id"]
+                                else:
+                                    pnum = int(st.session_state["next_patient_number"])
+                                    st.session_state["next_patient_number"] = pnum + 1
+                                    patient_id = f"Patient {pnum:03d}"
                                 record = build_patient_record(
                                     patient_id=patient_id,
                                     signals=person_signals,
                                     thumbnail=thumb,
                                 )
-                                st.session_state["patients"].append(record)
+                                record["face_embeddings"] = templates
+                                _, merged = _save_or_merge_patient(record)
+                                verb = "updated" if merged else "auto-saved"
                                 _notify(
                                     f"\U0001f6a8 CRITICAL ALERT \u2014 {patient_id} "
-                                    f"(P{pid:02d}) auto-saved (score {score} "
+                                    f"(P{pid:02d}) {verb} (score {score} "
                                     f"for {CRITICAL_ALERT_SECONDS:.0f}s)"
                                 )
                             critical_timers[pid] = None
@@ -768,6 +894,7 @@ def _run_continuous_monitoring(frame_slot, signal_slot):
                 st.session_state["monitoring_data"] = {
                     "all_final": tracker.get_all_final(),
                     "face_crops": dict(face_crops),
+                    "face_emb_map": dict(face_emb_map),
                     "thumbnail": latest_rgb_frame,
                 }
     finally:
@@ -905,9 +1032,19 @@ def _sidebar_controls() -> tuple[str, int, str, list, float, bool, bool]:
 # Main
 # ---------------------------------------------------------------------------
 
+_LOGO_PATH = pathlib.Path(__file__).with_name("logo.png")
+
+
+@st.cache_data
+def _logo_b64() -> str:
+    if _LOGO_PATH.exists():
+        return base64.b64encode(_LOGO_PATH.read_bytes()).decode()
+    return ""
+
+
 def main() -> None:
     """Render the SightLion dashboard."""
-    st.set_page_config(page_title="SightLion", layout="wide")
+    st.set_page_config(page_title="SightLion", page_icon=str(_LOGO_PATH), layout="wide")
     _inject_styles()
     _ensure_state()
 
@@ -931,14 +1068,17 @@ def main() -> None:
         st.session_state["patients"] = build_demo_patients()
         _notify("Loaded demo patients.")
 
+    logo_data = _logo_b64()
+    logo_tag = (
+        f'<img class="tv-logo" src="data:image/png;base64,{logo_data}" alt="SightLion"/>'
+        if logo_data
+        else ""
+    )
     st.markdown(
-        '<div class="tv-header">'
-        '<div class="tv-cross">+</div>'
-        "<div>"
-        '<div class="tv-header-title">SightLion</div>'
-        '<div class="tv-header-sub">AI-assisted ER intake monitoring for staff review</div>'
-        "</div>"
-        "</div>",
+        f'<div class="tv-header">'
+        f'{logo_tag}'
+        f'<div class="tv-header-sub">AI-assisted ER intake monitoring</div>'
+        f"</div>",
         unsafe_allow_html=True,
     )
 
@@ -998,22 +1138,40 @@ def main() -> None:
                     data = st.session_state.get("monitoring_data")
                     if data and data.get("all_final"):
                         saved_crops = data.get("face_crops", {})
+                        saved_emb_map = data.get("face_emb_map", {})
                         fallback = (
                             resize_thumbnail(data["thumbnail"])
                             if data.get("thumbnail") is not None
                             else None
                         )
+                        saved_count, merged_count = 0, 0
                         for pdata in data["all_final"]:
                             override = patient_override if len(data["all_final"]) == 1 else ""
-                            pid = _consume_patient_id(override)
-                            thumb = saved_crops.get(pdata["person_id"], fallback)
+                            track_pid = pdata["person_id"]
+                            templates = saved_emb_map.get(track_pid, [])
+                            match_idx = _find_matching_patient(
+                                templates, st.session_state["patients"]
+                            )
+                            if match_idx is not None:
+                                pid = st.session_state["patients"][match_idx]["patient_id"]
+                            else:
+                                pid = _consume_patient_id(override)
+                            thumb = saved_crops.get(track_pid, fallback)
                             record = build_patient_record(
                                 patient_id=pid, signals=pdata["signals"], thumbnail=thumb
                             )
-                            st.session_state["patients"].append(record)
-                        _notify(
-                            f"Saved {len(data['all_final'])} patient(s) to queue."
-                        )
+                            record["face_embeddings"] = templates
+                            _, merged = _save_or_merge_patient(record)
+                            saved_count += 1
+                            if merged:
+                                merged_count += 1
+                        parts = []
+                        new_count = saved_count - merged_count
+                        if new_count:
+                            parts.append(f"{new_count} new")
+                        if merged_count:
+                            parts.append(f"{merged_count} updated")
+                        _notify(f"Saved {' / '.join(parts)} patient(s) to queue.")
                     st.session_state["monitoring_data"] = None
                     st.rerun()
                 elif monitoring:
@@ -1036,10 +1194,8 @@ def main() -> None:
                         records = _capture_live_patients(
                             frame_slot, signal_slot, patient_override, capture_seconds
                         )
-                    for record in records:
-                        st.session_state["patients"].append(record)
                     if records:
-                        _notify(f"Added {len(records)} patient(s) to the queue.")
+                        _notify(f"Saved {len(records)} patient(s) to the queue.")
                 else:
                     _preview_live_webcam(frame_slot, signal_slot)
 
@@ -1072,14 +1228,22 @@ def main() -> None:
                                     if len(uploaded_files) == 1 and len(all_final) == 1
                                     else ""
                                 )
-                                pid = _consume_patient_id(override)
+                                templates = pdata.get("face_embeddings", [])
+                                match_idx = _find_matching_patient(
+                                    templates, st.session_state["patients"]
+                                )
+                                if match_idx is not None:
+                                    pid = st.session_state["patients"][match_idx]["patient_id"]
+                                else:
+                                    pid = _consume_patient_id(override)
                                 thumb = pdata.get("face_crop", fallback_thumb)
                                 rec = build_patient_record(
                                     patient_id=pid,
                                     signals=pdata["signals"],
                                     thumbnail=thumb,
                                 )
-                                st.session_state["patients"].append(rec)
+                                rec["face_embeddings"] = templates
+                                _save_or_merge_patient(rec)
                         finally:
                             if tmp and os.path.exists(tmp):
                                 os.remove(tmp)

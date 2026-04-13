@@ -5,22 +5,39 @@ from __future__ import annotations
 from typing import Dict
 
 WEIGHTS: Dict[str, float] = {
-    "hands_near_throat": 0.25,
-    "low_alertness": 0.20,
-    "arm_drift": 0.18,
+    "low_alertness": 0.30,
+    "hands_near_throat": 0.20,
     "slumped_posture": 0.15,
+    "arm_drift": 0.10,
     "body_sway": 0.12,
-    "tripod_position": 0.06,
-    "facial_asymmetry": 0.04,
+    "tripod_position": 0.08,
+    "facial_asymmetry": 0.05,
 }
 
 CLINICAL_HIGH = 0.50
 CLINICAL_MODERATE = 0.25
 CLINICAL_FINDING = 0.30
 
-STROKE_HIGH = 0.65
-STROKE_MODERATE = 0.40
-STROKE_FINDING = 0.45
+_PERSIST_REQUIRED = 0.30
+_STRONG_SINGLE = 0.70
+
+_FALL_SWAY_FINDING = 0.40
+_FALL_SWAY_HIGH = 0.55
+_FALL_POSTURE_HIGH = 0.50
+_FALL_PERSIST_HIGH = 0.50
+
+
+def _persist(signals: dict, key: str) -> float:
+    """Persistence estimate for a signal (fraction of time above noise).
+
+    The accumulated average already acts as a persistence proxy: a high
+    running mean means the signal has been consistently elevated.
+    """
+    return float(signals.get(key, 0.0))
+
+STROKE_HIGH = 0.75
+STROKE_MODERATE = 0.50
+STROKE_FINDING = 0.55
 
 
 def compute_score(signals: dict) -> int:
@@ -69,20 +86,36 @@ def derive_stroke_risk(signals: dict) -> dict:
 
 
 def derive_fall_risk(signals: dict) -> dict:
+    """Fall risk requires sustained, strong sway — ideally with postural collapse.
+
+    Sway alone can reach at most MODERATE.  HIGH requires either
+    (a) sway + posture both confirmed, or (b) severe postural collapse alone.
+    """
     sway = float(signals.get("body_sway", 0))
     posture = float(signals.get("slumped_posture", 0))
-    peak = max(sway, posture)
+
+    sway_persist = _persist(signals, "body_sway")
+    posture_persist = _persist(signals, "slumped_posture")
+
+    sway_strong = sway > _FALL_SWAY_HIGH and sway_persist >= _FALL_PERSIST_HIGH
+    posture_strong = posture > _FALL_POSTURE_HIGH and posture_persist >= _FALL_PERSIST_HIGH
+
     findings: list[str] = []
-    if sway > CLINICAL_FINDING:
-        findings.append("Balance instability")
-    if posture > CLINICAL_FINDING:
+    if sway > _FALL_SWAY_FINDING and sway_persist >= _PERSIST_REQUIRED:
+        findings.append("Sustained balance instability")
+    elif sway > _FALL_SWAY_FINDING:
+        findings.append("Transient sway detected")
+    if posture > CLINICAL_FINDING and posture_persist >= _PERSIST_REQUIRED:
         findings.append("Postural collapse")
-    if peak > CLINICAL_HIGH:
+
+    if (sway_strong and posture_strong) or (posture_strong and posture > _STRONG_SINGLE):
         level = "HIGH"
-    elif peak > CLINICAL_MODERATE:
+    elif findings:
         level = "MODERATE"
     else:
         level = "LOW"
+        findings = []
+
     return {"level": level, "color": _level_color(level), "findings": findings}
 
 
